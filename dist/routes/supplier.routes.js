@@ -31,4 +31,34 @@ router.post('/', async (req, res) => {
         res.status(500).json({ error: 'Failed to create supplier' });
     }
 });
+// PUT update supplier
+router.put('/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { name, contact, email } = req.body;
+        if (!name)
+            return res.status(400).json({ error: 'Name is required' });
+        const supplier = await prisma.supplier.update({
+            where: { id },
+            data: { name, contact, email }
+        });
+        res.json(supplier);
+    }
+    catch (error) {
+        res.status(500).json({ error: 'Failed to update supplier' });
+    }
+});
+// DELETE supplier
+router.delete('/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        await prisma.supplier.delete({
+            where: { id }
+        });
+        res.status(204).send();
+    }
+    catch (error) {
+        res.status(500).json({ error: 'Failed to delete supplier' });
+    }
+});
 exports.default = router;

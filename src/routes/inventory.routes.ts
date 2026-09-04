@@ -20,7 +20,8 @@ router.get('/', async (req: Request, res: Response) => {
         : undefined,
       include: {
         category: true,
-        supplier: true
+        supplier: true,
+        unit: true
       },
       orderBy: { createdAt: 'desc' }
     });
@@ -50,6 +51,7 @@ router.post('/', async (req: Request, res: Response) => {
         min_stock: parseInt(data.min_stock) || 0,
         categoryId: data.categoryId,
         supplierId: data.supplierId,
+        unitId: data.unitId || null,
         location: data.location || '',
         status: data.status || 'Active',
       },
@@ -80,6 +82,7 @@ router.put('/:id', async (req: Request, res: Response) => {
         min_stock: data.min_stock !== undefined ? parseInt(data.min_stock) : undefined,
         categoryId: data.categoryId,
         supplierId: data.supplierId,
+        unitId: data.unitId || null,
         location: data.location,
         status: data.status,
       },

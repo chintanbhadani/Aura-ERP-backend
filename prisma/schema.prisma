@@ -26,6 +26,12 @@ model Category {
   products Product[]
 }
 
+model Unit {
+  id       String    @id @default(uuid())
+  name     String
+  products Product[]
+}
+
 model Product {
   id           String    @id @default(uuid())
   sku          String    @unique
@@ -40,6 +46,8 @@ model Product {
   category     Category  @relation(fields: [categoryId], references: [id])
   supplierId   String
   supplier     Supplier  @relation(fields: [supplierId], references: [id])
+  unitId       String?
+  unit         Unit?     @relation(fields: [unitId], references: [id])
   createdAt    DateTime  @default(now())
   updatedAt    DateTime  @updatedAt
 }
