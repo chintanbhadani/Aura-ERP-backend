@@ -13,6 +13,8 @@ import authRoutes from './routes/auth.routes';
 import supplierRoutes from './routes/supplier.routes';
 import categoryRoutes from './routes/category.routes';
 import unitRoutes from './routes/unit.routes';
+import customerRoutes from './routes/customer.routes';
+import invoiceRoutes from './routes/invoice.routes';
 
 // Routes setup
 app.get('/health', (req, res) => {
@@ -24,6 +26,8 @@ app.use('/api/inventory', inventoryRoutes);
 app.use('/api/suppliers', supplierRoutes);
 app.use('/api/categories', categoryRoutes);
 app.use('/api/units', unitRoutes);
+app.use('/api/customers', customerRoutes);
+app.use('/api/invoices', invoiceRoutes);
 
 // Global Error Handler
 app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {

@@ -14,6 +14,8 @@ const auth_routes_1 = __importDefault(require("./routes/auth.routes"));
 const supplier_routes_1 = __importDefault(require("./routes/supplier.routes"));
 const category_routes_1 = __importDefault(require("./routes/category.routes"));
 const unit_routes_1 = __importDefault(require("./routes/unit.routes"));
+const customer_routes_1 = __importDefault(require("./routes/customer.routes"));
+const invoice_routes_1 = __importDefault(require("./routes/invoice.routes"));
 // Routes setup
 app.get('/health', (req, res) => {
     res.json({ status: 'OK', message: 'Inventory Management API Running' });
@@ -23,6 +25,8 @@ app.use('/api/inventory', inventory_routes_1.default);
 app.use('/api/suppliers', supplier_routes_1.default);
 app.use('/api/categories', category_routes_1.default);
 app.use('/api/units', unit_routes_1.default);
+app.use('/api/customers', customer_routes_1.default);
+app.use('/api/invoices', invoice_routes_1.default);
 // Global Error Handler
 app.use((err, req, res, next) => {
     console.error(err.stack);
