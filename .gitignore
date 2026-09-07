@@ -1,5 +1,7 @@
 # .env
 # /.env
+dist
+/dist
 build
 /build
 uploads
