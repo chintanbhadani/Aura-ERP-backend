@@ -2,6 +2,9 @@
 # /.env
 dist
 /dist
+/dist/
+/dist/*
+/dist/*.js
 build
 /build
 uploads
@@ -12,7 +15,6 @@ dailyBackups
 /.sequelizerc
 /node_modules
 /dailyBackups
-/tsconfig.json
 /dailyBackups/
 /dailyBackups/*
 /logs/server.log
