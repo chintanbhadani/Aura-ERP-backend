@@ -1,5 +1,9 @@
 import { Router, Request, Response } from 'express';
 import { PrismaClient } from '@prisma/client';
+import multer from 'multer';
+import * as xlsx from 'xlsx';
+
+const upload = multer({ storage: multer.memoryStorage() });
 
 const router = Router();
 const prisma = new PrismaClient();
@@ -103,6 +107,93 @@ router.delete('/:id', async (req: Request, res: Response) => {
     res.status(204).send();
   } catch (error) {
     res.status(500).json({ error: 'Failed to delete product' });
+  }
+});
+
+// POST bulk upload
+router.post('/bulk-upload', upload.single('file'), async (req: Request, res: Response) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+
+    const workbook = xlsx.read(req.file.buffer, { type: 'buffer' });
+    const sheetName = workbook.SheetNames[0];
+    const sheet = workbook.Sheets[sheetName];
+    const rows = xlsx.utils.sheet_to_json<any>(sheet);
+
+    let successCount = 0;
+    const errors = [];
+
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      try {
+        // Validation
+        if (!row.sku || !row.name || row.quantity === undefined || !row.cost_price || !row.selling_price || !row.categoryName || !row.supplierName) {
+          errors.push(`Row ${i + 2}: Missing required fields`);
+          continue;
+        }
+
+        // Find or create Category
+        let category = await prisma.category.findFirst({ where: { name: row.categoryName } });
+        if (!category) {
+          category = await prisma.category.create({ data: { name: row.categoryName } });
+        }
+
+        // Find or create Supplier
+        let supplier = await prisma.supplier.findFirst({ where: { name: row.supplierName } });
+        if (!supplier) {
+          supplier = await prisma.supplier.create({ data: { name: row.supplierName } });
+        }
+
+        // Find or create Unit
+        let unit = null;
+        if (row.unitName) {
+          unit = await prisma.unit.findFirst({ where: { name: row.unitName } });
+          if (!unit) {
+            unit = await prisma.unit.create({ data: { name: row.unitName } });
+          }
+        }
+
+        // Upsert Product
+        await prisma.product.upsert({
+          where: { sku: row.sku.toString() },
+          update: {
+            name: row.name,
+            quantity: parseInt(row.quantity),
+            cost_price: parseFloat(row.cost_price),
+            selling_price: parseFloat(row.selling_price),
+            min_stock: parseInt(row.min_stock) || 0,
+            categoryId: category.id,
+            supplierId: supplier.id,
+            unitId: unit?.id || null,
+            location: row.location || '',
+            status: row.status || 'Active',
+          },
+          create: {
+            sku: row.sku.toString(),
+            name: row.name,
+            quantity: parseInt(row.quantity),
+            cost_price: parseFloat(row.cost_price),
+            selling_price: parseFloat(row.selling_price),
+            min_stock: parseInt(row.min_stock) || 0,
+            categoryId: category.id,
+            supplierId: supplier.id,
+            unitId: unit?.id || null,
+            location: row.location || '',
+            status: row.status || 'Active',
+          },
+        });
+        successCount++;
+      } catch (err: any) {
+        errors.push(`Row ${i + 2}: ${err.message}`);
+      }
+    }
+
+    res.json({ message: `Successfully processed ${successCount} rows.`, errors });
+  } catch (error) {
+    console.error('Bulk upload error', error);
+    res.status(500).json({ error: 'Failed to process bulk upload' });
   }
 });
 
