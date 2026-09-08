@@ -22,9 +22,10 @@ model Supplier {
 }
 
 model Category {
-  id       String    @id @default(uuid())
-  name     String
-  products Product[]
+  id         String      @id @default(uuid())
+  name       String
+  products   Product[]
+  skuMasters SkuMaster[]
 }
 
 model Unit {
@@ -47,6 +48,7 @@ model Product {
   category      Category      @relation(fields: [categoryId], references: [id])
   supplierId    String
   supplier      Supplier      @relation(fields: [supplierId], references: [id])
+  invoiceDate   DateTime?
   unitId        String?
   unit          Unit?         @relation(fields: [unitId], references: [id])
   invoiceItems  InvoiceItem[]
@@ -106,3 +108,29 @@ model InvoiceItem {
   unitPrice  Decimal @db.Decimal(10, 2)
   totalPrice Decimal @db.Decimal(10, 2)
 }
+
+model SkuMaster {
+  id         String    @id @default(uuid())
+  name       String
+  sku        String    @unique
+  categoryId String?
+  category   Category? @relation(fields: [categoryId], references: [id])
+}
+
+model Expense {
+  id          String   @id @default(uuid())
+  date        DateTime @default(now())
+  description String
+  amount      Decimal  @db.Decimal(10, 2)
+  notes       String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model ExpenseMaster {
+  id          String   @id @default(uuid())
+  description String   @unique
+  createdAt   DateTime @default(now())
+}
+
+

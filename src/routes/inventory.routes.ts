@@ -37,6 +37,27 @@ router.get('/', async (req: Request, res: Response) => {
   }
 });
 
+// GET single item by ID
+router.get('/:id', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const product = await prisma.product.findUnique({
+      where: { id },
+      include: {
+        category: true,
+        supplier: true,
+        unit: true
+      },
+    });
+    if (!product) {
+      return res.status(404).json({ error: 'Product not found' });
+    }
+    res.json(product);
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to fetch product' });
+  }
+});
+
 // POST new item
 router.post('/', async (req: Request, res: Response) => {
   try {
@@ -57,6 +78,7 @@ router.post('/', async (req: Request, res: Response) => {
         categoryId: data.categoryId,
         supplierId: data.supplierId,
         unitId: data.unitId || null,
+        invoiceDate: data.invoiceDate ? new Date(data.invoiceDate) : null,
         location: data.location || '',
         status: data.status || 'Active',
       },
@@ -88,6 +110,7 @@ router.put('/:id', async (req: Request, res: Response) => {
         categoryId: data.categoryId,
         supplierId: data.supplierId,
         unitId: data.unitId || null,
+        invoiceDate: data.invoiceDate ? new Date(data.invoiceDate) : undefined,
         location: data.location,
         status: data.status,
       },
