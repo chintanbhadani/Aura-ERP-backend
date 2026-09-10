@@ -68,7 +68,7 @@ async function calculateValuationsForProduct(product: any, ledgers: any[]) {
 // GET all items (with optional search)
 router.get('/', async (req: Request, res: Response) => {
   try {
-    const { search } = req.query;
+    const { search, stockFilter } = req.query;
     
     const products = await prisma.product.findMany({
       where: search
@@ -97,9 +97,15 @@ router.get('/', async (req: Request, res: Response) => {
       }
     });
 
-    const productsWithValuation = await Promise.all(
+    let productsWithValuation = await Promise.all(
       products.map(p => calculateValuationsForProduct(p, ledgers))
     );
+    
+    if (stockFilter === 'low_stock') {
+      productsWithValuation = productsWithValuation.filter(p => p.quantity <= p.min_stock);
+    } else if (stockFilter === 'healthy') {
+      productsWithValuation = productsWithValuation.filter(p => p.quantity > p.min_stock);
+    }
     
     res.json(productsWithValuation);
   } catch (error) {
