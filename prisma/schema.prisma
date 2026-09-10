@@ -52,6 +52,7 @@ model Product {
   unitId        String?
   unit          Unit?         @relation(fields: [unitId], references: [id])
   invoiceItems  InvoiceItem[]
+  stockLedgers  StockLedger[]
   createdAt     DateTime      @default(now())
   updatedAt     DateTime      @updatedAt
 }
@@ -87,6 +88,7 @@ model Invoice {
   date          DateTime      @default(now())
   totalAmount   Decimal       @db.Decimal(10, 2)
   items         InvoiceItem[]
+  stockLedgers  StockLedger[]
 
   customerId String?
   customer   Customer? @relation(fields: [customerId], references: [id])
@@ -133,4 +135,16 @@ model ExpenseMaster {
   createdAt   DateTime @default(now())
 }
 
-
+model StockLedger {
+  id             String   @id @default(uuid())
+  productId      String
+  product        Product  @relation(fields: [productId], references: [id])
+  date           DateTime // The transaction/invoice date
+  type           String // 'PURCHASE', 'SALES', 'INITIAL', 'ADJUSTMENT'
+  quantityChange Int
+  runningBalance Int
+  invoiceId      String?
+  invoice        Invoice? @relation(fields: [invoiceId], references: [id])
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+}

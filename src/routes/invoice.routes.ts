@@ -101,14 +101,51 @@ router.post('/', async (req: Request, res: Response) => {
 
     const invoiceNumber = await generateInvoiceNumber(type as InvoiceType);
 
+    const invoiceDate = new Date(date || Date.now());
+
     // Use a transaction to ensure all operations succeed or fail together
     const result = await prisma.$transaction(async (tx) => {
-      // 1. Create Invoice and Items
+      // 1. Verify chronological stock (The "Future-Dip" check)
+      for (const item of items) {
+        const quantityChange = type === 'PURCHASE' ? Number(item.quantity) : -Number(item.quantity);
+        
+        if (type === 'SALES') {
+          // Check stock point-in-time and future
+          const minBalanceResult: any = await tx.$queryRaw`
+            WITH proposed_ledger AS (
+                SELECT date, "quantityChange"
+                FROM "StockLedger"
+                WHERE "productId" = ${item.productId}
+                
+                UNION ALL
+                
+                SELECT ${invoiceDate}::TIMESTAMP, ${quantityChange}::INTEGER
+            ),
+            cumulative_calculation AS (
+                SELECT 
+                    date,
+                    SUM("quantityChange") OVER (ORDER BY date ASC) AS cumulative_balance
+                FROM proposed_ledger
+            )
+            SELECT MIN(cumulative_balance) AS min_future_balance
+            FROM cumulative_calculation
+            WHERE date >= ${invoiceDate}::TIMESTAMP;
+          `;
+          
+          const minFutureBalance = minBalanceResult[0]?.min_future_balance ? Number(minBalanceResult[0].min_future_balance) : quantityChange;
+          
+          if (minFutureBalance < 0) {
+            throw new Error(`Insufficient stock for product. Backdating this sale causes inventory to drop below zero (Dip: ${minFutureBalance}) on or after ${invoiceDate.toISOString()}.`);
+          }
+        }
+      }
+
+      // 2. Create Invoice and Items
       const invoice = await tx.invoice.create({
         data: {
           invoiceNumber,
           type,
-          date: new Date(date || Date.now()),
+          date: invoiceDate,
           totalAmount,
           customerId: type === 'SALES' ? customerId : null,
           supplierId: type === 'PURCHASE' ? supplierId : null,
@@ -126,7 +163,7 @@ router.post('/', async (req: Request, res: Response) => {
         },
       });
 
-      // 2. Update Inventory
+      // 3. Update Inventory and Ledger
       for (const item of items) {
         const product = await tx.product.findUnique({
           where: { id: item.productId },
@@ -137,16 +174,43 @@ router.post('/', async (req: Request, res: Response) => {
         }
 
         const quantityChange = type === 'PURCHASE' ? Number(item.quantity) : -Number(item.quantity);
-        const newQuantity = product.quantity + quantityChange;
+        
+        // Calculate the specific running balance for THIS new row based on past ledger entries
+        const currentBalanceResult: any = await tx.$queryRaw`
+          SELECT COALESCE(SUM("quantityChange"), 0) AS balance_before
+          FROM "StockLedger"
+          WHERE "productId" = ${item.productId}
+            AND date < ${invoiceDate}::TIMESTAMP
+        `;
+        
+        const balanceBefore = currentBalanceResult[0]?.balance_before ? Number(currentBalanceResult[0].balance_before) : 0;
+        const newRunningBalance = balanceBefore + quantityChange;
 
-        // Optionally prevent negative inventory for sales
-        // if (type === 'SALES' && newQuantity < 0) {
-        //   throw new Error(`Insufficient inventory for product ${product.name}`);
-        // }
+        // Insert into ledger
+        await tx.stockLedger.create({
+          data: {
+            productId: item.productId,
+            date: invoiceDate,
+            type: type,
+            quantityChange: quantityChange,
+            runningBalance: newRunningBalance,
+            invoiceId: invoice.id,
+          }
+        });
 
+        // Forward Recalculation for future ledger entries if this was backdated
+        await tx.$queryRaw`
+            UPDATE "StockLedger"
+            SET "runningBalance" = "runningBalance" + ${quantityChange}
+            WHERE "productId" = ${item.productId}
+              AND date > ${invoiceDate}::TIMESTAMP
+        `;
+
+        // Update the cached quantity on the product
+        const newProductQuantity = product.quantity + quantityChange;
         await tx.product.update({
           where: { id: item.productId },
-          data: { quantity: newQuantity },
+          data: { quantity: newProductQuantity },
         });
       }
 
