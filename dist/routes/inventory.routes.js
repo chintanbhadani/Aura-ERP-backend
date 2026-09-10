@@ -44,6 +44,54 @@ const logger_1 = __importDefault(require("../utils/logger"));
 const upload = (0, multer_1.default)({ storage: multer_1.default.memoryStorage() });
 const router = (0, express_1.Router)();
 const prisma = new client_1.PrismaClient();
+// Helper to calculate WAC and FIFO for a product
+async function calculateValuationsForProduct(product, ledgers) {
+    const productLedgers = ledgers.filter(l => l.productId === product.id);
+    let wacQty = 0;
+    let wacPrice = 0;
+    let fifoQueue = [];
+    for (const l of productLedgers) {
+        if (l.type === 'PURCHASE' && l.invoice) {
+            const item = l.invoice.items.find((i) => i.productId === product.id);
+            if (item) {
+                const qty = Number(item.quantity);
+                const price = Number(item.unitPrice);
+                // WAC
+                const newTotalValue = (wacQty * wacPrice) + (qty * price);
+                wacQty += qty;
+                wacPrice = wacQty > 0 ? newTotalValue / wacQty : 0;
+                // FIFO
+                fifoQueue.push({ qty, price });
+            }
+        }
+        else if (l.type === 'SALES' || l.quantityChange < 0) {
+            const qtyToDeduct = Math.abs(l.quantityChange);
+            // WAC
+            wacQty = Math.max(0, wacQty - qtyToDeduct);
+            // FIFO
+            let remainingToDeduct = qtyToDeduct;
+            while (remainingToDeduct > 0 && fifoQueue.length > 0) {
+                if (fifoQueue[0].qty <= remainingToDeduct) {
+                    remainingToDeduct -= fifoQueue[0].qty;
+                    fifoQueue.shift();
+                }
+                else {
+                    fifoQueue[0].qty -= remainingToDeduct;
+                    remainingToDeduct = 0;
+                }
+            }
+        }
+    }
+    const fifoValue = fifoQueue.reduce((sum, batch) => sum + (batch.qty * batch.price), 0);
+    const fifoPrice = fifoQueue.length > 0 ? fifoQueue[0].price : 0;
+    return {
+        ...product,
+        wacPrice,
+        wacValue: wacQty * wacPrice,
+        fifoPrice,
+        fifoValue
+    };
+}
 // GET all items (with optional search)
 router.get('/', async (req, res) => {
     try {
@@ -64,10 +112,51 @@ router.get('/', async (req, res) => {
             },
             orderBy: { createdAt: 'desc' }
         });
-        res.json(products);
+        // Fetch all relevant ledgers once to avoid N+1 queries
+        const ledgers = await prisma.stockLedger.findMany({
+            orderBy: { date: 'asc' },
+            include: {
+                invoice: {
+                    include: { items: true }
+                }
+            }
+        });
+        const productsWithValuation = await Promise.all(products.map(p => calculateValuationsForProduct(p, ledgers)));
+        res.json(productsWithValuation);
     }
     catch (error) {
         res.status(500).json({ error: 'Failed to fetch inventory' });
+    }
+});
+// GET single item by ID
+router.get('/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const product = await prisma.product.findUnique({
+            where: { id },
+            include: {
+                category: true,
+                supplier: true,
+                unit: true
+            },
+        });
+        if (!product) {
+            return res.status(404).json({ error: 'Product not found' });
+        }
+        const ledgers = await prisma.stockLedger.findMany({
+            where: { productId: id },
+            orderBy: { date: 'asc' },
+            include: {
+                invoice: {
+                    include: { items: true }
+                }
+            }
+        });
+        const productWithValuation = await calculateValuationsForProduct(product, ledgers);
+        res.json(productWithValuation);
+    }
+    catch (error) {
+        res.status(500).json({ error: 'Failed to fetch product' });
     }
 });
 // POST new item
@@ -75,20 +164,21 @@ router.post('/', async (req, res) => {
     try {
         const data = req.body;
         // Basic validation
-        if (!data.sku || !data.name || data.quantity === undefined || !data.cost_price || !data.selling_price || !data.categoryId || !data.supplierId) {
+        if (!data.sku || !data.name || !data.cost_price || !data.selling_price || !data.categoryId || !data.supplierId) {
             return res.status(400).json({ error: 'Missing required fields' });
         }
         const product = await prisma.product.create({
             data: {
                 sku: data.sku,
                 name: data.name,
-                quantity: parseInt(data.quantity),
+                quantity: 0, // Force quantity to 0 on creation. Stock is managed via Purchase Invoices.
                 cost_price: parseFloat(data.cost_price),
                 selling_price: parseFloat(data.selling_price),
                 min_stock: parseInt(data.min_stock) || 0,
                 categoryId: data.categoryId,
                 supplierId: data.supplierId,
                 unitId: data.unitId || null,
+                invoiceDate: null, // Removed manual invoice dates
                 location: data.location || '',
                 status: data.status || 'Active',
             },
@@ -119,6 +209,7 @@ router.put('/:id', async (req, res) => {
                 categoryId: data.categoryId,
                 supplierId: data.supplierId,
                 unitId: data.unitId || null,
+                invoiceDate: data.invoiceDate ? new Date(data.invoiceDate) : undefined,
                 location: data.location,
                 status: data.status,
             },

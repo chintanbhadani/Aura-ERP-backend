@@ -1,7 +1,46 @@
 "use strict";
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
 Object.defineProperty(exports, "__esModule", { value: true });
 const express_1 = require("express");
 const client_1 = require("@prisma/client");
+const multer_1 = __importDefault(require("multer"));
+const xlsx = __importStar(require("xlsx"));
+const upload = (0, multer_1.default)({ storage: multer_1.default.memoryStorage() });
 const router = (0, express_1.Router)();
 const prisma = new client_1.PrismaClient();
 // GET all categories
@@ -35,12 +74,18 @@ router.post('/', async (req, res) => {
 router.put('/:id', async (req, res) => {
     try {
         const { id } = req.params;
-        const { name } = req.body;
-        if (!name)
-            return res.status(400).json({ error: 'Name is required' });
+        const { name, status } = req.body;
+        // Allow updating just the status, or just the name
+        if (!name && !status)
+            return res.status(400).json({ error: 'Data is required to update' });
+        const updateData = {};
+        if (name)
+            updateData.name = name;
+        if (status)
+            updateData.status = status;
         const category = await prisma.category.update({
             where: { id },
-            data: { name }
+            data: updateData
         });
         res.json(category);
     }
@@ -48,7 +93,7 @@ router.put('/:id', async (req, res) => {
         res.status(500).json({ error: 'Failed to update category' });
     }
 });
-// DELETE category
+// DELETE category (Soft delete can be done via PUT status='Inactive', but keeping route for backward compatibility if needed, or removing it. We will just leave it as is for now, but UI won't call it).
 router.delete('/:id', async (req, res) => {
     try {
         const { id } = req.params;
@@ -59,6 +104,40 @@ router.delete('/:id', async (req, res) => {
     }
     catch (error) {
         res.status(500).json({ error: 'Failed to delete category' });
+    }
+});
+// POST bulk upload categories
+router.post('/bulk-upload', upload.single('file'), async (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({ error: 'No file uploaded' });
+        }
+        const workbook = xlsx.read(req.file.buffer, { type: 'buffer' });
+        const sheetName = workbook.SheetNames[0];
+        const sheet = workbook.Sheets[sheetName];
+        const rows = xlsx.utils.sheet_to_json(sheet);
+        let successCount = 0;
+        const errors = [];
+        for (let i = 0; i < rows.length; i++) {
+            const row = rows[i];
+            try {
+                if (!row.name) {
+                    errors.push(`Row ${i + 2}: Missing name`);
+                    continue;
+                }
+                await prisma.category.create({
+                    data: { name: row.name }
+                });
+                successCount++;
+            }
+            catch (err) {
+                errors.push(`Row ${i + 2}: ${err.message}`);
+            }
+        }
+        res.json({ message: `Successfully processed ${successCount} rows.`, errors });
+    }
+    catch (error) {
+        res.status(500).json({ error: 'Failed to process bulk upload' });
     }
 });
 exports.default = router;

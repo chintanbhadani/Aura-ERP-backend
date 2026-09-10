@@ -17,6 +17,7 @@ model Supplier {
   name     String
   contact  String?
   email    String?
+  status   Status    @default(Active)
   products Product[]
   invoices Invoice[]
 }
@@ -24,6 +25,7 @@ model Supplier {
 model Category {
   id         String      @id @default(uuid())
   name       String
+  status     Status      @default(Active)
   products   Product[]
   skuMasters SkuMaster[]
 }
@@ -31,6 +33,7 @@ model Category {
 model Unit {
   id       String    @id @default(uuid())
   name     String
+  status   Status    @default(Active)
   products Product[]
 }
 
@@ -73,6 +76,7 @@ model Customer {
   name     String
   contact  String?
   email    String?
+  status   Status    @default(Active)
   invoices Invoice[]
 }
 
@@ -115,6 +119,7 @@ model SkuMaster {
   id         String    @id @default(uuid())
   name       String
   sku        String    @unique
+  status     Status    @default(Active)
   categoryId String?
   category   Category? @relation(fields: [categoryId], references: [id])
 }
