@@ -118,7 +118,7 @@ router.post('/descriptions', async (req: Request, res: Response) => {
 // POST new expense
 router.post('/', async (req: Request, res: Response) => {
   try {
-    const { date, description, amount, notes } = req.body;
+    const { date, description, amount, notes, paymentType } = req.body;
 
     if (!description || !description.trim()) {
       return res.status(400).json({ error: 'Description is required' });
@@ -141,16 +141,52 @@ router.post('/', async (req: Request, res: Response) => {
       // Ignore unique constraint error
     }
 
-    const expense = await prisma.expense.create({
-      data: {
-        date: date ? new Date(date) : new Date(),
-        description: cleanDesc,
-        amount: Number(amount),
-        notes: notes ? notes.trim() : null,
-      },
+    const result = await prisma.$transaction(async (tx) => {
+      const expense = await tx.expense.create({
+        data: {
+          date: date ? new Date(date) : new Date(),
+          description: cleanDesc,
+          amount: Number(amount),
+          notes: notes ? notes.trim() : null,
+          paymentType: paymentType || 'CASH',
+        },
+      });
+
+      const expenseDate = expense.date;
+      const expenseAmount = Number(amount);
+      const pType = expense.paymentType; // CASH or BANK
+
+      const currentBalanceResult: any = await tx.$queryRaw`
+        SELECT COALESCE(SUM("amountChange"), 0) AS balance_before
+        FROM "CashLedger"
+        WHERE CAST("paymentType" AS TEXT) = ${pType}
+          AND date < ${expenseDate}::TIMESTAMP
+      `;
+      const balanceBefore = currentBalanceResult[0]?.balance_before ? Number(currentBalanceResult[0].balance_before) : 0;
+      const newRunningBalance = balanceBefore - expenseAmount;
+
+      await tx.cashLedger.create({
+        data: {
+          date: expenseDate,
+          paymentType: pType,
+          sourceType: 'EXPENSE',
+          amountChange: -expenseAmount,
+          runningBalance: newRunningBalance,
+          expenseId: expense.id,
+        }
+      });
+
+      await tx.$queryRaw`
+          UPDATE "CashLedger"
+          SET "runningBalance" = "runningBalance" - ${expenseAmount}
+          WHERE CAST("paymentType" AS TEXT) = ${pType}
+            AND date > ${expenseDate}::TIMESTAMP
+      `;
+
+      return expense;
     });
 
-    res.status(201).json(expense);
+    res.status(201).json(result);
   } catch (error) {
     console.error('Error creating expense:', error);
     res.status(500).json({ error: 'Failed to create expense' });
@@ -161,7 +197,7 @@ router.post('/', async (req: Request, res: Response) => {
 router.put('/:id', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-    const { date, description, amount, notes } = req.body;
+    const { date, description, amount, notes, paymentType } = req.body;
 
     if (!description || !description.trim()) {
       return res.status(400).json({ error: 'Description is required' });
@@ -190,6 +226,7 @@ router.put('/:id', async (req: Request, res: Response) => {
         description: cleanDesc,
         amount: Number(amount),
         notes: notes !== undefined ? (notes ? notes.trim() : null) : undefined,
+        paymentType: paymentType || undefined,
       },
     });
 

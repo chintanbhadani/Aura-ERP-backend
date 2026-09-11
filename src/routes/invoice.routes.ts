@@ -88,7 +88,7 @@ router.get('/:id', async (req: Request, res: Response) => {
 // POST create new invoice
 router.post('/', async (req: Request, res: Response) => {
   try {
-    const { type, date, customerId, supplierId, items } = req.body;
+    const { type, date, customerId, supplierId, items, paymentType, cashAmount, bankAmount, creditAmount } = req.body;
 
     if (!type || !items || !items.length) {
       return res.status(400).json({ error: 'Type and items are required' });
@@ -148,6 +148,10 @@ router.post('/', async (req: Request, res: Response) => {
         }
       }
 
+      const finalCashAmount = cashAmount !== undefined ? Number(cashAmount) : (paymentType === 'CASH' ? totalAmount : 0);
+      const finalBankAmount = bankAmount !== undefined ? Number(bankAmount) : (paymentType === 'BANK' ? totalAmount : 0);
+      const finalCreditAmount = creditAmount !== undefined ? Number(creditAmount) : (paymentType === 'CREDIT' ? totalAmount : 0);
+
       // 2. Create Invoice and Items
       const invoice = await tx.invoice.create({
         data: {
@@ -157,6 +161,10 @@ router.post('/', async (req: Request, res: Response) => {
           totalAmount,
           customerId: type === 'SALES' ? customerId : null,
           supplierId: type === 'PURCHASE' ? supplierId : null,
+          paymentType: paymentType || 'CASH',
+          cashAmount: finalCashAmount,
+          bankAmount: finalBankAmount,
+          creditAmount: finalCreditAmount,
           items: {
             create: items.map((item: any) => ({
               productId: item.productId,
@@ -220,6 +228,69 @@ router.post('/', async (req: Request, res: Response) => {
           where: { id: item.productId },
           data: { quantity: newProductQuantity },
         });
+      }
+
+      // 4. Update Cash Ledger
+      if (finalCashAmount > 0) {
+        const cashQuantityChange = type === 'SALES' ? finalCashAmount : -finalCashAmount;
+        
+        const currentCashBalanceResult: any = await tx.$queryRaw`
+          SELECT COALESCE(SUM("amountChange"), 0) AS balance_before
+          FROM "CashLedger"
+          WHERE "paymentType" = 'CASH'
+            AND date < ${invoiceDate}::TIMESTAMP
+        `;
+        const cashBalanceBefore = currentCashBalanceResult[0]?.balance_before ? Number(currentCashBalanceResult[0].balance_before) : 0;
+        const newCashRunningBalance = cashBalanceBefore + cashQuantityChange;
+
+        await tx.cashLedger.create({
+          data: {
+            date: invoiceDate,
+            paymentType: 'CASH',
+            sourceType: type === 'SALES' ? 'SALE' : 'PURCHASE',
+            amountChange: cashQuantityChange,
+            runningBalance: newCashRunningBalance,
+            invoiceId: invoice.id,
+          }
+        });
+
+        await tx.$queryRaw`
+            UPDATE "CashLedger"
+            SET "runningBalance" = "runningBalance" + ${cashQuantityChange}
+            WHERE "paymentType" = 'CASH'
+              AND date > ${invoiceDate}::TIMESTAMP
+        `;
+      }
+
+      if (finalBankAmount > 0) {
+        const bankQuantityChange = type === 'SALES' ? finalBankAmount : -finalBankAmount;
+        
+        const currentBankBalanceResult: any = await tx.$queryRaw`
+          SELECT COALESCE(SUM("amountChange"), 0) AS balance_before
+          FROM "CashLedger"
+          WHERE "paymentType" = 'BANK'
+            AND date < ${invoiceDate}::TIMESTAMP
+        `;
+        const bankBalanceBefore = currentBankBalanceResult[0]?.balance_before ? Number(currentBankBalanceResult[0].balance_before) : 0;
+        const newBankRunningBalance = bankBalanceBefore + bankQuantityChange;
+
+        await tx.cashLedger.create({
+          data: {
+            date: invoiceDate,
+            paymentType: 'BANK',
+            sourceType: type === 'SALES' ? 'SALE' : 'PURCHASE',
+            amountChange: bankQuantityChange,
+            runningBalance: newBankRunningBalance,
+            invoiceId: invoice.id,
+          }
+        });
+
+        await tx.$queryRaw`
+            UPDATE "CashLedger"
+            SET "runningBalance" = "runningBalance" + ${bankQuantityChange}
+            WHERE "paymentType" = 'BANK'
+              AND date > ${invoiceDate}::TIMESTAMP
+        `;
       }
 
       return invoice;

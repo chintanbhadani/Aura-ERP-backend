@@ -20,6 +20,7 @@ model Supplier {
   status   Status    @default(Active)
   products Product[]
   invoices Invoice[]
+  payments Payment[]
 }
 
 model Category {
@@ -78,6 +79,14 @@ model Customer {
   email    String?
   status   Status    @default(Active)
   invoices Invoice[]
+  payments Payment[]
+}
+
+enum PaymentType {
+  CASH
+  BANK
+  CREDIT
+  PARTIAL
 }
 
 enum InvoiceType {
@@ -91,8 +100,13 @@ model Invoice {
   type          InvoiceType
   date          DateTime      @default(now())
   totalAmount   Decimal       @db.Decimal(10, 2)
+  paymentType   PaymentType   @default(CASH)
+  cashAmount    Decimal       @default(0) @db.Decimal(10, 2)
+  bankAmount    Decimal       @default(0) @db.Decimal(10, 2)
+  creditAmount  Decimal       @default(0) @db.Decimal(10, 2)
   items         InvoiceItem[]
   stockLedgers  StockLedger[]
+  payments      Payment[]
 
   customerId String?
   customer   Customer? @relation(fields: [customerId], references: [id])
@@ -129,6 +143,7 @@ model Expense {
   date        DateTime @default(now())
   description String
   amount      Decimal  @db.Decimal(10, 2)
+  paymentType PaymentType @default(CASH)
   notes       String?
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
@@ -152,4 +167,42 @@ model StockLedger {
   invoice        Invoice? @relation(fields: [invoiceId], references: [id])
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
+}
+
+model Payment {
+  id            String      @id @default(uuid())
+  date          DateTime    @default(now())
+  paymentType   PaymentType // CASH or BANK
+  direction     String      // "IN" or "OUT"
+  amount        Decimal     @db.Decimal(10, 2)
+  description   String?
+  
+  customerId    String?
+  customer      Customer?   @relation(fields: [customerId], references: [id])
+  
+  supplierId    String?
+  supplier      Supplier?   @relation(fields: [supplierId], references: [id])
+  
+  invoiceId     String?
+  invoice       Invoice?    @relation(fields: [invoiceId], references: [id])
+
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+}
+
+model CashLedger {
+  id             String      @id @default(uuid())
+  date           DateTime    // Transaction date
+  paymentType    PaymentType // CASH or BANK
+  sourceType     String      // 'SALE', 'PURCHASE', 'EXPENSE', 'PAYMENT', 'ADJUSTMENT'
+  amountChange   Decimal     @db.Decimal(10, 2) // Positive for IN, Negative for OUT
+  runningBalance Decimal     @db.Decimal(10, 2)
+  
+  // References to the source transaction
+  invoiceId      String?
+  expenseId      String?
+  paymentId      String?
+  
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
 }
