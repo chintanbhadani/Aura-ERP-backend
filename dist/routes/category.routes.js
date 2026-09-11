@@ -46,7 +46,14 @@ const prisma = new client_1.PrismaClient();
 // GET all categories
 router.get('/', async (req, res) => {
     try {
+        const { search, status } = req.query;
         const categories = await prisma.category.findMany({
+            where: {
+                AND: [
+                    search ? { name: { contains: search, mode: 'insensitive' } } : {},
+                    status && status !== 'ALL' ? { status: status } : {}
+                ]
+            },
             orderBy: { name: 'asc' }
         });
         res.json(categories);

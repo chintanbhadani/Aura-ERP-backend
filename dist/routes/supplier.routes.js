@@ -46,7 +46,14 @@ const prisma = new client_1.PrismaClient();
 // GET all suppliers
 router.get('/', async (req, res) => {
     try {
+        const { search, status } = req.query;
         const suppliers = await prisma.supplier.findMany({
+            where: {
+                AND: [
+                    search ? { name: { contains: search, mode: 'insensitive' } } : {},
+                    status && status !== 'ALL' ? { status: status } : {}
+                ]
+            },
             orderBy: { name: 'asc' }
         });
         res.json(suppliers);

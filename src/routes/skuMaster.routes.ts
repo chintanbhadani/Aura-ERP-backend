@@ -11,7 +11,14 @@ const prisma = new PrismaClient();
 // GET all SKUs
 router.get('/', async (req: Request, res: Response) => {
   try {
+    const { search, status } = req.query;
     const skus = await prisma.skuMaster.findMany({
+      where: {
+        AND: [
+          search ? { name: { contains: search as string, mode: 'insensitive' } } : {},
+          status && status !== 'ALL' ? { status: status as any } : {}
+        ]
+      },
       include: { category: true },
       orderBy: { name: 'asc' }
     });

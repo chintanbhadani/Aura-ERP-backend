@@ -11,7 +11,14 @@ const prisma = new PrismaClient();
 // GET all units
 router.get('/', async (req: Request, res: Response) => {
   try {
+    const { search, status } = req.query;
     const units = await prisma.unit.findMany({
+      where: {
+        AND: [
+          search ? { name: { contains: search as string, mode: 'insensitive' } } : {},
+          status && status !== 'ALL' ? { status: status as any } : {}
+        ]
+      },
       orderBy: { name: 'asc' }
     });
     res.json(units);

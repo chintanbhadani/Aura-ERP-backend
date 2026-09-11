@@ -31,7 +31,14 @@ const generateInvoiceNumber = async (type) => {
 // GET all invoices
 router.get('/', async (req, res) => {
     try {
+        const { search, type } = req.query;
         const invoices = await prisma.invoice.findMany({
+            where: {
+                AND: [
+                    search ? { invoiceNumber: { contains: search, mode: 'insensitive' } } : {},
+                    type && type !== 'ALL' ? { type: type } : {}
+                ]
+            },
             orderBy: { createdAt: 'desc' },
             include: {
                 customer: true,
