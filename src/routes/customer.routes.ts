@@ -120,4 +120,43 @@ router.post('/bulk-upload', upload.single('file'), async (req: Request, res: Res
   }
 });
 
+// POST bulk import customers (JSON)
+router.post('/bulk-import', async (req: Request, res: Response) => {
+  try {
+    const { items } = req.body;
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: 'Items array is required' });
+    }
+
+    let successCount = 0;
+    const errors: string[] = [];
+
+    for (let i = 0; i < items.length; i++) {
+      const row = items[i];
+      try {
+        const name = row.name || row['Customer Name'] || row.customerName || row['Client Name'];
+        if (!name) {
+          errors.push(`Row ${i + 1}: Missing name`);
+          continue;
+        }
+
+        await prisma.customer.create({
+          data: {
+            name: String(name).trim(),
+            contact: row.contact || row.phone ? String(row.contact || row.phone) : null,
+            email: row.email ? String(row.email) : null
+          }
+        });
+        successCount++;
+      } catch (err: any) {
+        errors.push(`Row ${i + 1}: ${err.message}`);
+      }
+    }
+
+    res.json({ message: `Successfully imported ${successCount} customers.`, count: successCount, errors });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message || 'Failed to bulk import customers' });
+  }
+});
+
 export default router;

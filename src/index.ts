@@ -1,10 +1,13 @@
+import dotenv from 'dotenv';
+dotenv.config();
+
 import express from 'express';
 import cors from 'cors';
 import inventoryRoutes from './routes/inventory.routes'; // TS should resolve this to inventory.routes.ts
 
 
 const app = express();
-const PORT = process.env.PORT || 4000;
+const PORT = process.env.PORT || 8000;
 
 app.use(cors());
 app.use(express.json());
@@ -19,6 +22,8 @@ import skuMasterRoutes from './routes/skuMaster.routes';
 import expenseRoutes from './routes/expense.routes';
 import paymentRoutes from './routes/payment.routes';
 import reportRoutes from './routes/report.routes';
+import partOfRoutes from './routes/partOf.routes';
+import subPartOfRoutes from './routes/subPartOf.routes';
 
 // Routes setup
 app.get('/health', (req, res) => {
@@ -32,6 +37,9 @@ app.use('/api/suppliers', supplierRoutes);
 app.use('/api/categories', categoryRoutes);
 app.use('/api/units', unitRoutes);
 app.use('/api/customers', customerRoutes);
+app.use('/api/clients', customerRoutes); // Alias for clients
+app.use('/api/part-of', partOfRoutes);
+app.use('/api/sub-part-of', subPartOfRoutes);
 app.use('/api/invoices', invoiceRoutes);
 app.use('/api/skus', skuMasterRoutes);
 app.use('/api/expenses', expenseRoutes);
