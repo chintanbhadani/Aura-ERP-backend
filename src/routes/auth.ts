@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { PrismaClient } from '@prisma/client';
 import { authorizeRole } from '../middleware/auth';
 import jwt from 'jsonwebtoken';
+import { getUserRoleDetails } from '../services/roleStore';
 
 const router = Router();
 const prisma = new PrismaClient();
@@ -27,9 +28,12 @@ router.post('/login', async (req, res) => {
       { expiresIn: '1d' }
     );
 
+    const roleDetails = getUserRoleDetails(user);
+
     res.json({
       user: { id: user.id, username: user.username, role: user.role },
-      token
+      token,
+      roleDetails
     });
   } catch (error) {
     res.status(500).json({ error: 'Login failed' });
@@ -43,7 +47,8 @@ router.get('/me', authorizeRole('PLANT_ADMIN', 'SHIFT_SUPERVISOR', 'QC_INSPECTOR
     
     // Dev fallback handling
     if (userId === 'dev-user') {
-      return res.json({ id: 'dev-user', username: 'dev', role: 'PLANT_ADMIN' });
+      const devRole = getUserRoleDetails({ id: 'dev-user', role: 'Admin' });
+      return res.json({ id: 'dev-user', username: 'dev', role: 'PLANT_ADMIN', roleDetails: devRole });
     }
 
     const user = await prisma.user.findUnique({
@@ -52,7 +57,11 @@ router.get('/me', authorizeRole('PLANT_ADMIN', 'SHIFT_SUPERVISOR', 'QC_INSPECTOR
     });
 
     if (!user) return res.status(404).json({ error: 'User not found' });
-    res.json(user);
+    const roleDetails = getUserRoleDetails(user);
+    res.json({
+      ...user,
+      roleDetails
+    });
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch profile' });
   }

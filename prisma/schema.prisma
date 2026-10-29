@@ -119,14 +119,18 @@ model Invoice {
 }
 
 model InvoiceItem {
-  id         String  @id @default(uuid())
-  invoiceId  String
-  invoice    Invoice @relation(fields: [invoiceId], references: [id])
-  productId  String
-  product    Product @relation(fields: [productId], references: [id])
-  quantity   Int
-  unitPrice  Decimal @db.Decimal(10, 2)
-  totalPrice Decimal @db.Decimal(10, 2)
+  id                String   @id @default(uuid())
+  invoiceId         String
+  invoice           Invoice  @relation(fields: [invoiceId], references: [id])
+  productId         String
+  product           Product  @relation(fields: [productId], references: [id])
+  quantity          Int
+  unitPrice         Decimal  @db.Decimal(10, 2)
+  totalPrice        Decimal  @db.Decimal(10, 2)
+  costPrice         Decimal? @db.Decimal(10, 2)
+  purchaseInvoiceNo String?
+  purchaseItemId    String?
+  poAllocations     Json?
 }
 
 model SkuMaster {

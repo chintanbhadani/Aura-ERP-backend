@@ -1,5 +1,5 @@
 import { Router, Request, Response } from 'express';
-import { PrismaClient, InvoiceType } from '@prisma/client';
+import { PrismaClient, InvoiceType, Prisma } from '@prisma/client';
 
 const router = Router();
 const prisma = new PrismaClient();
@@ -56,9 +56,133 @@ router.get('/', async (req: Request, res: Response) => {
         }
       },
     });
-    res.json(invoices);
+    const formatted = invoices.map((inv) => ({
+      ...inv,
+      client: inv.customer ? { ...inv.customer, companyName: inv.customer.name } : null,
+    }));
+    res.json(formatted);
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch invoices' });
+  }
+});
+
+// GET available purchase batches / PO lots for a specific product
+router.get('/available-batches/:productId', async (req: Request, res: Response) => {
+  try {
+    const { productId } = req.params;
+
+    const product = await prisma.product.findUnique({
+      where: { id: productId },
+    });
+
+    if (!product) {
+      return res.status(404).json({ error: 'Product not found' });
+    }
+
+    // 1. Fetch all purchase items for this product
+    const purchaseItems = await prisma.invoiceItem.findMany({
+      where: {
+        productId,
+        invoice: {
+          type: 'PURCHASE',
+        },
+      },
+      include: {
+        invoice: {
+          include: {
+            supplier: true,
+          },
+        },
+      },
+      orderBy: {
+        invoice: {
+          date: 'asc',
+        },
+      },
+    });
+
+    // 2. Fetch all sales items linked to any purchase item of this product
+    const salesItems = await prisma.invoiceItem.findMany({
+      where: {
+        productId,
+        invoice: {
+          type: 'SALES',
+        },
+        OR: [
+          { purchaseItemId: { not: null } },
+          { poAllocations: { not: Prisma.JsonNull } },
+        ],
+      },
+      select: {
+        purchaseItemId: true,
+        quantity: true,
+        poAllocations: true,
+      },
+    });
+
+    const soldQtyByPurchaseItem = new Map<string, number>();
+    for (const s of salesItems) {
+      if (Array.isArray(s.poAllocations) && s.poAllocations.length > 0) {
+        for (const alloc of s.poAllocations as any[]) {
+          if (alloc.purchaseItemId && alloc.quantity) {
+            soldQtyByPurchaseItem.set(
+              alloc.purchaseItemId,
+              (soldQtyByPurchaseItem.get(alloc.purchaseItemId) || 0) + Number(alloc.quantity)
+            );
+          }
+        }
+      } else if (s.purchaseItemId) {
+        soldQtyByPurchaseItem.set(
+          s.purchaseItemId,
+          (soldQtyByPurchaseItem.get(s.purchaseItemId) || 0) + s.quantity
+        );
+      }
+    }
+
+    const batches = [];
+
+    // Add batches from purchase invoices
+    for (const pi of purchaseItems) {
+      const sold = soldQtyByPurchaseItem.get(pi.id) || 0;
+      const available = pi.quantity - sold;
+
+      if (available > 0) {
+        batches.push({
+          purchaseItemId: pi.id,
+          poNumber: pi.invoice.invoiceNumber,
+          date: pi.invoice.date,
+          supplierName: pi.invoice.supplier?.name || 'Direct Purchase',
+          unitCost: Number(pi.unitPrice),
+          initialQuantity: pi.quantity,
+          availableQuantity: available,
+        });
+      }
+    }
+
+    // Only fallback to INITIAL-STOCK if NO purchase invoice/PO has ever been created for this product
+    if (purchaseItems.length === 0 && product.quantity > 0) {
+      batches.unshift({
+        purchaseItemId: 'INITIAL',
+        poNumber: 'INITIAL-STOCK',
+        date: product.createdAt,
+        supplierName: 'Opening Stock',
+        unitCost: Number(product.cost_price),
+        initialQuantity: product.quantity,
+        availableQuantity: product.quantity,
+      });
+    }
+
+    res.json({
+      productId: product.id,
+      productName: product.name,
+      sku: product.sku,
+      totalStock: product.quantity,
+      defaultSellingPrice: Number(product.selling_price),
+      batches,
+    });
+  } catch (error: any) {
+    console.error('Error fetching available batches:', error);
+    res.status(500).json({ error: error.message || 'Failed to fetch available batches' });
   }
 });
 
@@ -79,7 +203,11 @@ router.get('/:id', async (req: Request, res: Response) => {
       },
     });
     if (!invoice) return res.status(404).json({ error: 'Invoice not found' });
-    res.json(invoice);
+    const formatted = {
+      ...invoice,
+      client: invoice.customer ? { ...invoice.customer, companyName: invoice.customer.name } : null,
+    };
+    res.json(formatted);
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch invoice' });
   }
@@ -140,7 +268,9 @@ router.post('/', async (req: Request, res: Response) => {
             WHERE date >= ${invoiceDate}::TIMESTAMP;
           `;
           
-          const minFutureBalance = minBalanceResult[0]?.min_future_balance ? Number(minBalanceResult[0].min_future_balance) : quantityChange;
+          const rawMin = minBalanceResult[0]?.min_future_balance;
+          const minFutureBalance =
+            rawMin !== undefined && rawMin !== null ? Number(rawMin) : quantityChange;
           
           if (minFutureBalance < 0) {
             throw new Error(`Insufficient stock for product. Backdating this sale causes inventory to drop below zero (Dip: ${minFutureBalance}) on or after ${invoiceDate.toISOString()}.`);
@@ -171,6 +301,10 @@ router.post('/', async (req: Request, res: Response) => {
               quantity: Number(item.quantity),
               unitPrice: Number(item.unitPrice),
               totalPrice: Number(item.quantity) * Number(item.unitPrice),
+              costPrice: item.costPrice !== undefined && item.costPrice !== null ? Number(item.costPrice) : null,
+              purchaseInvoiceNo: item.purchaseInvoiceNo || null,
+              purchaseItemId: item.purchaseItemId || null,
+              poAllocations: item.poAllocations || null,
             })),
           },
         },
@@ -300,6 +434,22 @@ router.post('/', async (req: Request, res: Response) => {
   } catch (error: any) {
     console.error(error);
     res.status(500).json({ error: error.message || 'Failed to create invoice' });
+  }
+});
+
+// DELETE invoice by id
+router.delete('/:id', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    await prisma.$transaction(async (tx) => {
+      await tx.invoiceItem.deleteMany({ where: { invoiceId: id } });
+      await tx.stockLedger.deleteMany({ where: { invoiceId: id } });
+      await tx.cashLedger.deleteMany({ where: { invoiceId: id } });
+      await tx.invoice.delete({ where: { id } });
+    });
+    res.json({ message: 'Invoice deleted successfully' });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message || 'Failed to delete invoice' });
   }
 });
 

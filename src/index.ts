@@ -24,6 +24,7 @@ import paymentRoutes from './routes/payment.routes';
 import reportRoutes from './routes/report.routes';
 import partOfRoutes from './routes/partOf.routes';
 import subPartOfRoutes from './routes/subPartOf.routes';
+import stockEntryRoutes from './routes/stockEntry.routes';
 
 // Routes setup
 app.get('/health', (req, res) => {
@@ -42,9 +43,16 @@ app.use('/api/part-of', partOfRoutes);
 app.use('/api/sub-part-of', subPartOfRoutes);
 app.use('/api/invoices', invoiceRoutes);
 app.use('/api/skus', skuMasterRoutes);
+app.use('/api/skuMaster', skuMasterRoutes); // Alias for frontend fetchSkus
 app.use('/api/expenses', expenseRoutes);
 app.use('/api/payments', paymentRoutes);
 app.use('/api/reports', reportRoutes);
+app.use('/api/stock-entries', stockEntryRoutes);
+app.use('/api/stock-ledger', stockEntryRoutes); // Alias
+app.use('/api/bin-report', (req, res, next) => {
+  req.url = '/bin-report' + req.url;
+  inventoryRoutes(req, res, next);
+});
 
 // Global Error Handler
 app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {

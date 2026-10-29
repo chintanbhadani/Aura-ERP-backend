@@ -8,22 +8,58 @@ const upload = multer({ storage: multer.memoryStorage() });
 const router = Router();
 const prisma = new PrismaClient();
 
-// GET all SKUs
+// GET all SKUs / Item Master items
 router.get('/', async (req: Request, res: Response) => {
   try {
     const { search, status } = req.query;
-    const skus = await prisma.skuMaster.findMany({
+    const products = await prisma.product.findMany({
       where: {
         AND: [
-          search ? { name: { contains: search as string, mode: 'insensitive' } } : {},
-          status && status !== 'ALL' ? { status: status as any } : {}
-        ]
+          search
+            ? {
+                OR: [
+                  { name: { contains: search as string, mode: 'insensitive' } },
+                  { sku: { contains: search as string, mode: 'insensitive' } },
+                ],
+              }
+            : {},
+          status && status !== 'ALL' ? { status: status as any } : {},
+        ],
       },
-      include: { category: true },
-      orderBy: { name: 'asc' }
+      include: {
+        category: true,
+        supplier: true,
+        unit: true,
+      },
+      orderBy: { name: 'asc' },
     });
-    res.json(skus);
+
+    const items = products.map((p) => ({
+      id: p.id,
+      name: p.name,
+      sku: p.sku,
+      sku_name: p.name,
+      price: Number(p.selling_price),
+      selling_price: Number(p.selling_price),
+      cost_price: Number(p.cost_price),
+      quantity: p.quantity,
+      uom: p.unit?.name || 'Pcs',
+      unitId: p.unitId,
+      unit: p.unit,
+      categoryId: p.categoryId,
+      category: p.category,
+      supplierId: p.supplierId,
+      supplier: p.supplier,
+      status: p.status,
+      location: p.location,
+      min_stock: p.min_stock,
+      createdAt: p.createdAt,
+      updatedAt: p.updatedAt,
+    }));
+
+    res.json(items);
   } catch (error) {
+    console.error('Failed to fetch SKUs:', error);
     res.status(500).json({ error: 'Failed to fetch SKUs' });
   }
 });
