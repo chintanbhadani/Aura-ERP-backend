@@ -289,6 +289,7 @@ router.get('/sales-summary', async (req: Request, res: Response) => {
           invoiceId: inv.id,
           invoiceNumber: inv.invoiceNumber,
           date: inv.date.toISOString(),
+          createdAt: inv.createdAt.toISOString(),
           paymentType: inv.paymentType,
           clientName,
           clientContact,
