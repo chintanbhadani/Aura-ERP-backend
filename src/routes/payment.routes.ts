@@ -8,7 +8,7 @@ const prisma = new PrismaClient();
 router.get('/', async (req: Request, res: Response) => {
   try {
     const payments = await prisma.payment.findMany({
-      orderBy: { date: 'desc' },
+      orderBy: { updatedAt: 'desc' },
       include: {
         customer: true,
         supplier: true,

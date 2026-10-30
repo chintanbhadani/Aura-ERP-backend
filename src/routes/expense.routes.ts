@@ -45,7 +45,7 @@ router.get('/', async (req: Request, res: Response) => {
 
     const expenses = await prisma.expense.findMany({
       where,
-      orderBy: { date: 'desc' },
+      orderBy: { updatedAt: 'desc' },
     });
 
     res.json(expenses);

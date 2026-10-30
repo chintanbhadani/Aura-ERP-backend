@@ -45,7 +45,7 @@ router.get('/', async (req: Request, res: Response) => {
           type && type !== 'ALL' ? { type: type as any } : {}
         ]
       },
-      orderBy: { createdAt: 'desc' },
+      orderBy: { updatedAt: 'desc' },
       include: {
         customer: true,
         supplier: true,

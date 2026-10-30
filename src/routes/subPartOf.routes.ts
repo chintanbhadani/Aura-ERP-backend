@@ -20,7 +20,7 @@ router.get('/', async (req: Request, res: Response) => {
             },
           }
         : undefined,
-      orderBy: { createdAt: 'desc' },
+      orderBy: { updatedAt: 'desc' },
     });
     res.json(items);
   } catch (error) {

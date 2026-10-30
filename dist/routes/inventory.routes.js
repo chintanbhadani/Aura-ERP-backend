@@ -110,7 +110,7 @@ router.get('/', async (req, res) => {
                 supplier: true,
                 unit: true
             },
-            orderBy: { createdAt: 'desc' }
+            orderBy: { updatedAt: 'desc' }
         });
         // Fetch all relevant ledgers once to avoid N+1 queries
         const ledgers = await prisma.stockLedger.findMany({

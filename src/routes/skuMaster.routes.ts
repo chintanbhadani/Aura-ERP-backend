@@ -31,7 +31,7 @@ router.get('/', async (req: Request, res: Response) => {
         supplier: true,
         unit: true,
       },
-      orderBy: { name: 'asc' },
+      orderBy: { updatedAt: 'desc' },
     });
 
     const items = products.map((p) => ({

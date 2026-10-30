@@ -84,7 +84,7 @@ router.get('/', async (req: Request, res: Response) => {
         supplier: true,
         unit: true
       },
-      orderBy: { createdAt: 'desc' }
+      orderBy: { updatedAt: 'desc' }
     });
 
     // Fetch all relevant ledgers once to avoid N+1 queries
