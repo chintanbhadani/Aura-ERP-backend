@@ -216,7 +216,7 @@ router.get('/:id', async (req: Request, res: Response) => {
 // POST create new invoice
 router.post('/', async (req: Request, res: Response) => {
   try {
-    const { type, date, customerId, supplierId, items, paymentType, cashAmount, bankAmount, creditAmount } = req.body;
+    const { type, date, customerId, supplierId, items, paymentType, cashAmount, bankAmount, creditAmount, mobileMoneyAmount } = req.body;
 
     if (!type || !items || !items.length) {
       return res.status(400).json({ error: 'Type and items are required' });
@@ -281,6 +281,7 @@ router.post('/', async (req: Request, res: Response) => {
       const finalCashAmount = cashAmount !== undefined ? Number(cashAmount) : (paymentType === 'CASH' ? totalAmount : 0);
       const finalBankAmount = bankAmount !== undefined ? Number(bankAmount) : (paymentType === 'BANK' ? totalAmount : 0);
       const finalCreditAmount = creditAmount !== undefined ? Number(creditAmount) : (paymentType === 'CREDIT' ? totalAmount : 0);
+      const finalMobileMoneyAmount = mobileMoneyAmount !== undefined ? Number(mobileMoneyAmount) : (paymentType === 'MOBILE_MONEY' ? totalAmount : 0);
 
       // 2. Create Invoice and Items
       const invoice = await tx.invoice.create({
@@ -295,6 +296,7 @@ router.post('/', async (req: Request, res: Response) => {
           cashAmount: finalCashAmount,
           bankAmount: finalBankAmount,
           creditAmount: finalCreditAmount,
+          mobileMoneyAmount: finalMobileMoneyAmount,
           items: {
             create: items.map((item: any) => ({
               productId: item.productId,

@@ -95,6 +95,7 @@ enum PaymentType {
   BANK
   CREDIT
   PARTIAL
+  MOBILE_MONEY
 }
 
 enum InvoiceType {
@@ -103,18 +104,19 @@ enum InvoiceType {
 }
 
 model Invoice {
-  id            String        @id @default(uuid())
-  invoiceNumber String        @unique
-  type          InvoiceType
-  date          DateTime      @default(now())
-  totalAmount   Decimal       @db.Decimal(10, 2)
-  paymentType   PaymentType   @default(CASH)
-  cashAmount    Decimal       @default(0) @db.Decimal(10, 2)
-  bankAmount    Decimal       @default(0) @db.Decimal(10, 2)
-  creditAmount  Decimal       @default(0) @db.Decimal(10, 2)
-  items         InvoiceItem[]
-  stockLedgers  StockLedger[]
-  payments      Payment[]
+  id                String        @id @default(uuid())
+  invoiceNumber     String        @unique
+  type              InvoiceType
+  date              DateTime      @default(now())
+  totalAmount       Decimal       @db.Decimal(10, 2)
+  paymentType       PaymentType   @default(CASH)
+  cashAmount        Decimal       @default(0) @db.Decimal(10, 2)
+  bankAmount        Decimal       @default(0) @db.Decimal(10, 2)
+  creditAmount      Decimal       @default(0) @db.Decimal(10, 2)
+  mobileMoneyAmount Decimal?      @default(0) @db.Decimal(10, 2)
+  items             InvoiceItem[]
+  stockLedgers      StockLedger[]
+  payments          Payment[]
 
   customerId String?
   customer   Customer? @relation(fields: [customerId], references: [id])
@@ -233,4 +235,14 @@ model SubPartOf {
   disabled  Boolean  @default(false)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+}
+
+model CashBookConfig {
+  id                   String   @id @default(uuid())
+  key                  String   @unique @default("DEFAULT")
+  initialOpeningCash   Decimal  @default(0) @db.Decimal(12, 2)
+  initialOpeningBank   Decimal  @default(0) @db.Decimal(12, 2)
+  initialOpeningAirtel Decimal  @default(0) @db.Decimal(12, 2)
+  notes                String?
+  updatedAt            DateTime @updatedAt
 }
