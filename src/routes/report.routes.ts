@@ -180,7 +180,7 @@ router.get('/cash-book', async (req: Request, res: Response) => {
 
     // 1. Fetch initial configuration
     let config = await prisma.cashBookConfig.findFirst({ where: { key: 'DEFAULT' } });
-    const initialCash = config ? Number(config.initialOpeningCash) : 201000;
+    const initialCash = config ? Number(config.initialOpeningCash) : 0;
     const initialBank = config ? Number(config.initialOpeningBank) : 0;
     const initialAirtel = config ? Number(config.initialOpeningAirtel) : 0;
 
