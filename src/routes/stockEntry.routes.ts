@@ -54,7 +54,10 @@ router.get('/', async (req: Request, res: Response) => {
           },
         },
       },
-      orderBy: { date: 'desc' },
+      orderBy: [
+        { date: 'desc' },
+        { createdAt: 'desc' },
+      ],
     });
 
     const formatted = ledgers.map((l) => ({
@@ -87,6 +90,7 @@ router.get('/', async (req: Request, res: Response) => {
           }
         : null,
       createdAt: l.createdAt.toISOString(),
+      updatedAt: l.updatedAt ? l.updatedAt.toISOString() : l.createdAt.toISOString(),
     }));
 
     res.json(formatted);
