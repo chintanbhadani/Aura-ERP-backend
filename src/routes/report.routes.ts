@@ -36,7 +36,7 @@ router.get('/cash-book/config', async (req: Request, res: Response) => {
       config = await prisma.cashBookConfig.create({
         data: {
           key: 'DEFAULT',
-          initialOpeningCash: 201000,
+          initialOpeningCash: 0,
           initialOpeningBank: 0,
           initialOpeningAirtel: 0,
           notes: 'Standard Initial Opening Balances'
@@ -152,6 +152,16 @@ router.post('/cash-book/quick-entry', async (req: Request, res: Response) => {
           direction: 'IN',
           amount: numAmount,
           description: description || 'Starting Opening Balance / Capital Inflow'
+        }
+      });
+    } else if (type === 'EXPENSE') {
+      const cleanDesc = description?.trim() || 'Store Operating Expense';
+      createdPayment = await prisma.expense.create({
+        data: {
+          date: txDate,
+          description: cleanDesc,
+          amount: numAmount,
+          paymentType: (paymentType as any) || 'CASH'
         }
       });
     } else {
@@ -339,30 +349,39 @@ router.get('/cash-book', async (req: Request, res: Response) => {
         const dir = pay.direction;
 
         const isBankTransfer = desc.includes('bank') || desc.includes('deposit') || desc.includes('withdraw');
-        const isOpeningCapital = desc.includes('opening balance') || desc.includes('capital') || desc.includes('starting balance');
+        // Customer credit settlement ONLY if customerId exists or explicitly noted as customer/credit collection
+        const isCustomerPayment = Boolean(pay.customerId) || desc.includes('customer') || desc.includes('client') || desc.includes('credit sale') || desc.includes('credit collection') || desc.includes('received payment for credit');
+        // Supplier payout ONLY if supplierId exists or explicitly noted as supplier payout
+        const isSupplierPayment = Boolean(pay.supplierId) || desc.includes('supplier') || desc.includes('vendor') || desc.includes('payment to supplier') || desc.includes('purchase payout');
 
         if (pType === 'CASH') {
           if (dir === 'IN') {
             if (isBankTransfer) {
               dayCashOutFromBank += amt; // Withdrawn from bank into cash
-            } else if (isOpeningCapital) {
-              // Direct capital / opening balance injection into store cash (without distorting credit receivables)
-              dayCashSales += amt;
+            } else if (isCustomerPayment) {
+              dayReceivedCreditSale += amt; // Cash collected from client for credit sale
             } else {
-              dayReceivedCreditSale += amt; // Cash collected from client
+              // Direct capital / opening balance injection / business cash (does NOT touch customer credit receivables)
+              dayCashSales += amt;
             }
           } else if (dir === 'OUT') {
             if (isBankTransfer) {
               dayCashInBank += amt; // Cash deposited into bank
-            } else {
+            } else if (isSupplierPayment) {
               dayCashPaymentForPurchase += amt; // Cash paid to supplier
+            } else {
+              dayCashExpenses += amt; // Cash operating expense
             }
           }
         } else if (pType === 'BANK') {
           if (dir === 'IN') {
-            dayBankCustomerIn += amt;
+            if (isCustomerPayment) {
+              dayBankCustomerIn += amt;
+            }
           } else if (dir === 'OUT') {
-            dayBankSupplierOut += amt;
+            if (isSupplierPayment) {
+              dayBankSupplierOut += amt;
+            }
           }
         }
       }
@@ -459,8 +478,8 @@ router.get('/cash-book', async (req: Request, res: Response) => {
         currentStoreCash: runningStoreCash,
         currentBankBalance: runningBank,
         currentAirtelBalance: runningAirtel,
-        totalCreditReceivable: runningCreditReceivable,
-        totalCreditPayable: runningCreditPayable,
+        totalCreditReceivable: Math.max(0, runningCreditReceivable),
+        totalCreditPayable: Math.max(0, runningCreditPayable),
         initialCash,
         initialBank,
         initialAirtel,
