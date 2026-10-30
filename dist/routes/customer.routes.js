@@ -62,6 +62,33 @@ router.get('/', async (req, res) => {
         res.status(500).json({ error: 'Failed to fetch customers' });
     }
 });
+// GET customer by ID
+router.get('/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const customer = await prisma.customer.findUnique({
+            where: { id },
+            include: {
+                invoices: true,
+                payments: true,
+                _count: {
+                    select: {
+                        invoices: true,
+                        payments: true,
+                    }
+                }
+            }
+        });
+        if (!customer) {
+            return res.status(404).json({ error: 'Customer not found' });
+        }
+        res.json(customer);
+    }
+    catch (error) {
+        console.error('Error fetching customer by id:', error);
+        res.status(500).json({ error: 'Failed to fetch customer' });
+    }
+});
 // POST new customer
 router.post('/', async (req, res) => {
     try {
@@ -152,6 +179,42 @@ router.post('/bulk-upload', upload.single('file'), async (req, res) => {
     }
     catch (error) {
         res.status(500).json({ error: 'Failed to process bulk upload' });
+    }
+});
+// POST bulk import customers (JSON)
+router.post('/bulk-import', async (req, res) => {
+    try {
+        const { items } = req.body;
+        if (!Array.isArray(items) || items.length === 0) {
+            return res.status(400).json({ error: 'Items array is required' });
+        }
+        let successCount = 0;
+        const errors = [];
+        for (let i = 0; i < items.length; i++) {
+            const row = items[i];
+            try {
+                const name = row.name || row['Customer Name'] || row.customerName || row['Client Name'];
+                if (!name) {
+                    errors.push(`Row ${i + 1}: Missing name`);
+                    continue;
+                }
+                await prisma.customer.create({
+                    data: {
+                        name: String(name).trim(),
+                        contact: row.contact || row.phone ? String(row.contact || row.phone) : null,
+                        email: row.email ? String(row.email) : null
+                    }
+                });
+                successCount++;
+            }
+            catch (err) {
+                errors.push(`Row ${i + 1}: ${err.message}`);
+            }
+        }
+        res.json({ message: `Successfully imported ${successCount} customers.`, count: successCount, errors });
+    }
+    catch (error) {
+        res.status(500).json({ error: error.message || 'Failed to bulk import customers' });
     }
 });
 exports.default = router;

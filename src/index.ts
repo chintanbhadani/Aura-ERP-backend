@@ -25,6 +25,8 @@ import reportRoutes from './routes/report.routes';
 import partOfRoutes from './routes/partOf.routes';
 import subPartOfRoutes from './routes/subPartOf.routes';
 import stockEntryRoutes from './routes/stockEntry.routes';
+import userRoutes from './routes/user.routes';
+import roleRoutes from './routes/role.routes';
 
 // Routes setup
 app.get('/health', (req, res) => {
@@ -32,6 +34,8 @@ app.get('/health', (req, res) => {
 });
 
 app.use('/api/auth', authRoutes);
+app.use('/api/users', userRoutes);
+app.use('/api/roles', roleRoutes);
 app.use('/api/inventory', inventoryRoutes);
 app.use('/api/products', inventoryRoutes); // Alias for product API
 app.use('/api/suppliers', supplierRoutes);

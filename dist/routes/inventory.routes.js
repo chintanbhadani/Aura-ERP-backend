@@ -134,6 +134,63 @@ router.get('/', async (req, res) => {
         res.status(500).json({ error: 'Failed to fetch inventory' });
     }
 });
+// GET Bin Report (Stock Balance)
+router.get('/bin-report', async (req, res) => {
+    try {
+        const { search, warehouse, itemGroup, filter } = req.query;
+        const whereClause = {};
+        if (search) {
+            const q = String(search).trim();
+            whereClause.OR = [
+                { name: { contains: q, mode: 'insensitive' } },
+                { sku: { contains: q, mode: 'insensitive' } },
+                { location: { contains: q, mode: 'insensitive' } },
+                { category: { name: { contains: q, mode: 'insensitive' } } },
+            ];
+        }
+        if (warehouse && warehouse !== 'ALL') {
+            whereClause.location = { contains: String(warehouse), mode: 'insensitive' };
+        }
+        if (itemGroup && itemGroup !== 'ALL') {
+            whereClause.category = { name: { contains: String(itemGroup), mode: 'insensitive' } };
+        }
+        const products = await prisma.product.findMany({
+            where: whereClause,
+            include: {
+                category: true,
+                unit: true,
+            },
+            orderBy: { name: 'asc' },
+        });
+        const parts = await prisma.partOf.findMany();
+        const subParts = await prisma.subPartOf.findMany();
+        const binReport = products.map((p, idx) => {
+            const part = parts.length > 0 ? parts[idx % parts.length].name : 'Standard';
+            const subPart = subParts.length > 0 ? subParts[idx % subParts.length].name : 'General';
+            return {
+                id: p.id,
+                itemCode: p.sku,
+                itemName: p.name,
+                itemGroup: p.category?.name || 'Finished Goods',
+                partOf: part,
+                subPartOf: subPart,
+                uom: p.unit?.name || 'Pcs',
+                actualQuantity: Number(p.quantity) || 0,
+                warehouse: p.location || 'Main Warehouse',
+                assignedTo: 'Plant Store',
+                tags: p.quantity <= p.min_stock ? 'LOW STOCK' : 'IN STOCK',
+            };
+        });
+        if (filter === 'low') {
+            return res.json(binReport.filter((item) => item.actualQuantity <= 0));
+        }
+        res.json(binReport);
+    }
+    catch (error) {
+        console.error('Failed to generate bin report:', error);
+        res.status(500).json({ error: error.message || 'Failed to generate bin report' });
+    }
+});
 // GET single item by ID
 router.get('/:id', async (req, res) => {
     try {

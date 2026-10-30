@@ -62,6 +62,35 @@ router.get('/', async (req, res) => {
         res.status(500).json({ error: 'Failed to fetch suppliers' });
     }
 });
+// GET supplier by ID
+router.get('/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const supplier = await prisma.supplier.findUnique({
+            where: { id },
+            include: {
+                products: true,
+                invoices: true,
+                payments: true,
+                _count: {
+                    select: {
+                        products: true,
+                        invoices: true,
+                        payments: true,
+                    }
+                }
+            }
+        });
+        if (!supplier) {
+            return res.status(404).json({ error: 'Supplier not found' });
+        }
+        res.json(supplier);
+    }
+    catch (error) {
+        console.error('Error fetching supplier by id:', error);
+        res.status(500).json({ error: 'Failed to fetch supplier' });
+    }
+});
 // POST new supplier
 router.post('/', async (req, res) => {
     try {

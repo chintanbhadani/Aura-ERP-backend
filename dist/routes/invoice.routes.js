@@ -50,10 +50,119 @@ router.get('/', async (req, res) => {
                 }
             },
         });
-        res.json(invoices);
+        const formatted = invoices.map((inv) => ({
+            ...inv,
+            client: inv.customer ? { ...inv.customer, companyName: inv.customer.name } : null,
+        }));
+        res.json(formatted);
     }
     catch (error) {
         res.status(500).json({ error: 'Failed to fetch invoices' });
+    }
+});
+// GET available purchase batches / PO lots for a specific product
+router.get('/available-batches/:productId', async (req, res) => {
+    try {
+        const { productId } = req.params;
+        const product = await prisma.product.findUnique({
+            where: { id: productId },
+        });
+        if (!product) {
+            return res.status(404).json({ error: 'Product not found' });
+        }
+        // 1. Fetch all purchase items for this product
+        const purchaseItems = await prisma.invoiceItem.findMany({
+            where: {
+                productId,
+                invoice: {
+                    type: 'PURCHASE',
+                },
+            },
+            include: {
+                invoice: {
+                    include: {
+                        supplier: true,
+                    },
+                },
+            },
+            orderBy: {
+                invoice: {
+                    date: 'asc',
+                },
+            },
+        });
+        // 2. Fetch all sales items linked to any purchase item of this product
+        const salesItems = await prisma.invoiceItem.findMany({
+            where: {
+                productId,
+                invoice: {
+                    type: 'SALES',
+                },
+                OR: [
+                    { purchaseItemId: { not: null } },
+                    { poAllocations: { not: client_1.Prisma.JsonNull } },
+                ],
+            },
+            select: {
+                purchaseItemId: true,
+                quantity: true,
+                poAllocations: true,
+            },
+        });
+        const soldQtyByPurchaseItem = new Map();
+        for (const s of salesItems) {
+            if (Array.isArray(s.poAllocations) && s.poAllocations.length > 0) {
+                for (const alloc of s.poAllocations) {
+                    if (alloc.purchaseItemId && alloc.quantity) {
+                        soldQtyByPurchaseItem.set(alloc.purchaseItemId, (soldQtyByPurchaseItem.get(alloc.purchaseItemId) || 0) + Number(alloc.quantity));
+                    }
+                }
+            }
+            else if (s.purchaseItemId) {
+                soldQtyByPurchaseItem.set(s.purchaseItemId, (soldQtyByPurchaseItem.get(s.purchaseItemId) || 0) + s.quantity);
+            }
+        }
+        const batches = [];
+        // Add batches from purchase invoices
+        for (const pi of purchaseItems) {
+            const sold = soldQtyByPurchaseItem.get(pi.id) || 0;
+            const available = pi.quantity - sold;
+            if (available > 0) {
+                batches.push({
+                    purchaseItemId: pi.id,
+                    poNumber: pi.invoice.invoiceNumber,
+                    date: pi.invoice.date,
+                    supplierName: pi.invoice.supplier?.name || 'Direct Purchase',
+                    unitCost: Number(pi.unitPrice),
+                    initialQuantity: pi.quantity,
+                    availableQuantity: available,
+                });
+            }
+        }
+        // Only fallback to INITIAL-STOCK if NO purchase invoice/PO has ever been created for this product
+        if (purchaseItems.length === 0 && product.quantity > 0) {
+            batches.unshift({
+                purchaseItemId: 'INITIAL',
+                poNumber: 'INITIAL-STOCK',
+                date: product.createdAt,
+                supplierName: 'Opening Stock',
+                unitCost: Number(product.cost_price),
+                initialQuantity: product.quantity,
+                availableQuantity: product.quantity,
+            });
+        }
+        res.json({
+            productId: product.id,
+            productName: product.name,
+            sku: product.sku,
+            totalStock: product.quantity,
+            defaultSellingPrice: Number(product.selling_price),
+            batches,
+        });
+    }
+    catch (error) {
+        console.error('Error fetching available batches:', error);
+        res.status(500).json({ error: error.message || 'Failed to fetch available batches' });
     }
 });
 // GET single invoice by id
@@ -74,7 +183,11 @@ router.get('/:id', async (req, res) => {
         });
         if (!invoice)
             return res.status(404).json({ error: 'Invoice not found' });
-        res.json(invoice);
+        const formatted = {
+            ...invoice,
+            client: invoice.customer ? { ...invoice.customer, companyName: invoice.customer.name } : null,
+        };
+        res.json(formatted);
     }
     catch (error) {
         res.status(500).json({ error: 'Failed to fetch invoice' });
@@ -83,7 +196,7 @@ router.get('/:id', async (req, res) => {
 // POST create new invoice
 router.post('/', async (req, res) => {
     try {
-        const { type, date, customerId, supplierId, items } = req.body;
+        const { type, date, customerId, supplierId, items, paymentType, cashAmount, bankAmount, creditAmount } = req.body;
         if (!type || !items || !items.length) {
             return res.status(400).json({ error: 'Type and items are required' });
         }
@@ -123,12 +236,16 @@ router.post('/', async (req, res) => {
             FROM cumulative_calculation
             WHERE date >= ${invoiceDate}::TIMESTAMP;
           `;
-                    const minFutureBalance = minBalanceResult[0]?.min_future_balance ? Number(minBalanceResult[0].min_future_balance) : quantityChange;
+                    const rawMin = minBalanceResult[0]?.min_future_balance;
+                    const minFutureBalance = rawMin !== undefined && rawMin !== null ? Number(rawMin) : quantityChange;
                     if (minFutureBalance < 0) {
                         throw new Error(`Insufficient stock for product. Backdating this sale causes inventory to drop below zero (Dip: ${minFutureBalance}) on or after ${invoiceDate.toISOString()}.`);
                     }
                 }
             }
+            const finalCashAmount = cashAmount !== undefined ? Number(cashAmount) : (paymentType === 'CASH' ? totalAmount : 0);
+            const finalBankAmount = bankAmount !== undefined ? Number(bankAmount) : (paymentType === 'BANK' ? totalAmount : 0);
+            const finalCreditAmount = creditAmount !== undefined ? Number(creditAmount) : (paymentType === 'CREDIT' ? totalAmount : 0);
             // 2. Create Invoice and Items
             const invoice = await tx.invoice.create({
                 data: {
@@ -138,12 +255,20 @@ router.post('/', async (req, res) => {
                     totalAmount,
                     customerId: type === 'SALES' ? customerId : null,
                     supplierId: type === 'PURCHASE' ? supplierId : null,
+                    paymentType: paymentType || 'CASH',
+                    cashAmount: finalCashAmount,
+                    bankAmount: finalBankAmount,
+                    creditAmount: finalCreditAmount,
                     items: {
                         create: items.map((item) => ({
                             productId: item.productId,
                             quantity: Number(item.quantity),
                             unitPrice: Number(item.unitPrice),
                             totalPrice: Number(item.quantity) * Number(item.unitPrice),
+                            costPrice: item.costPrice !== undefined && item.costPrice !== null ? Number(item.costPrice) : null,
+                            purchaseInvoiceNo: item.purchaseInvoiceNo || null,
+                            purchaseItemId: item.purchaseItemId || null,
+                            poAllocations: item.poAllocations || null,
                         })),
                     },
                 },
@@ -194,6 +319,61 @@ router.post('/', async (req, res) => {
                     data: { quantity: newProductQuantity },
                 });
             }
+            // 4. Update Cash Ledger
+            if (finalCashAmount > 0) {
+                const cashQuantityChange = type === 'SALES' ? finalCashAmount : -finalCashAmount;
+                const currentCashBalanceResult = await tx.$queryRaw `
+          SELECT COALESCE(SUM("amountChange"), 0) AS balance_before
+          FROM "CashLedger"
+          WHERE "paymentType" = 'CASH'
+            AND date < ${invoiceDate}::TIMESTAMP
+        `;
+                const cashBalanceBefore = currentCashBalanceResult[0]?.balance_before ? Number(currentCashBalanceResult[0].balance_before) : 0;
+                const newCashRunningBalance = cashBalanceBefore + cashQuantityChange;
+                await tx.cashLedger.create({
+                    data: {
+                        date: invoiceDate,
+                        paymentType: 'CASH',
+                        sourceType: type === 'SALES' ? 'SALE' : 'PURCHASE',
+                        amountChange: cashQuantityChange,
+                        runningBalance: newCashRunningBalance,
+                        invoiceId: invoice.id,
+                    }
+                });
+                await tx.$queryRaw `
+            UPDATE "CashLedger"
+            SET "runningBalance" = "runningBalance" + ${cashQuantityChange}
+            WHERE "paymentType" = 'CASH'
+              AND date > ${invoiceDate}::TIMESTAMP
+        `;
+            }
+            if (finalBankAmount > 0) {
+                const bankQuantityChange = type === 'SALES' ? finalBankAmount : -finalBankAmount;
+                const currentBankBalanceResult = await tx.$queryRaw `
+          SELECT COALESCE(SUM("amountChange"), 0) AS balance_before
+          FROM "CashLedger"
+          WHERE "paymentType" = 'BANK'
+            AND date < ${invoiceDate}::TIMESTAMP
+        `;
+                const bankBalanceBefore = currentBankBalanceResult[0]?.balance_before ? Number(currentBankBalanceResult[0].balance_before) : 0;
+                const newBankRunningBalance = bankBalanceBefore + bankQuantityChange;
+                await tx.cashLedger.create({
+                    data: {
+                        date: invoiceDate,
+                        paymentType: 'BANK',
+                        sourceType: type === 'SALES' ? 'SALE' : 'PURCHASE',
+                        amountChange: bankQuantityChange,
+                        runningBalance: newBankRunningBalance,
+                        invoiceId: invoice.id,
+                    }
+                });
+                await tx.$queryRaw `
+            UPDATE "CashLedger"
+            SET "runningBalance" = "runningBalance" + ${bankQuantityChange}
+            WHERE "paymentType" = 'BANK'
+              AND date > ${invoiceDate}::TIMESTAMP
+        `;
+            }
             return invoice;
         });
         res.status(201).json(result);
@@ -201,6 +381,22 @@ router.post('/', async (req, res) => {
     catch (error) {
         console.error(error);
         res.status(500).json({ error: error.message || 'Failed to create invoice' });
+    }
+});
+// DELETE invoice by id
+router.delete('/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        await prisma.$transaction(async (tx) => {
+            await tx.invoiceItem.deleteMany({ where: { invoiceId: id } });
+            await tx.stockLedger.deleteMany({ where: { invoiceId: id } });
+            await tx.cashLedger.deleteMany({ where: { invoiceId: id } });
+            await tx.invoice.delete({ where: { id } });
+        });
+        res.json({ message: 'Invoice deleted successfully' });
+    }
+    catch (error) {
+        res.status(500).json({ error: error.message || 'Failed to delete invoice' });
     }
 });
 exports.default = router;

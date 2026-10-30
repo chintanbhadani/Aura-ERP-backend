@@ -7,6 +7,7 @@ const express_1 = require("express");
 const client_1 = require("@prisma/client");
 const auth_1 = require("../middleware/auth");
 const jsonwebtoken_1 = __importDefault(require("jsonwebtoken"));
+const roleStore_1 = require("../services/roleStore");
 const router = (0, express_1.Router)();
 const prisma = new client_1.PrismaClient();
 const JWT_SECRET = process.env.JWT_SECRET || 'super-secret-key-fallback';
@@ -22,9 +23,11 @@ router.post('/login', async (req, res) => {
             return res.status(401).json({ error: 'Invalid credentials' });
         }
         const token = jsonwebtoken_1.default.sign({ id: user.id, username: user.username, role: user.role }, JWT_SECRET, { expiresIn: '1d' });
+        const roleDetails = (0, roleStore_1.getUserRoleDetails)(user);
         res.json({
             user: { id: user.id, username: user.username, role: user.role },
-            token
+            token,
+            roleDetails
         });
     }
     catch (error) {
@@ -37,7 +40,8 @@ router.get('/me', (0, auth_1.authorizeRole)('PLANT_ADMIN', 'SHIFT_SUPERVISOR', '
         const userId = req.user.id;
         // Dev fallback handling
         if (userId === 'dev-user') {
-            return res.json({ id: 'dev-user', username: 'dev', role: 'PLANT_ADMIN' });
+            const devRole = (0, roleStore_1.getUserRoleDetails)({ id: 'dev-user', role: 'Admin' });
+            return res.json({ id: 'dev-user', username: 'dev', role: 'PLANT_ADMIN', roleDetails: devRole });
         }
         const user = await prisma.user.findUnique({
             where: { id: userId },
@@ -45,7 +49,11 @@ router.get('/me', (0, auth_1.authorizeRole)('PLANT_ADMIN', 'SHIFT_SUPERVISOR', '
         });
         if (!user)
             return res.status(404).json({ error: 'User not found' });
-        res.json(user);
+        const roleDetails = (0, roleStore_1.getUserRoleDetails)(user);
+        res.json({
+            ...user,
+            roleDetails
+        });
     }
     catch (error) {
         res.status(500).json({ error: 'Failed to fetch profile' });
