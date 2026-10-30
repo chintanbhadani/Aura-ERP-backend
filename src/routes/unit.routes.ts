@@ -27,6 +27,33 @@ router.get('/', async (req: Request, res: Response) => {
   }
 });
 
+// GET unit by ID
+router.get('/:id', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const unit = await prisma.unit.findUnique({
+      where: { id },
+      include: {
+        products: true,
+        _count: {
+          select: {
+            products: true,
+          }
+        }
+      }
+    });
+
+    if (!unit) {
+      return res.status(404).json({ error: 'Unit not found' });
+    }
+
+    res.json(unit);
+  } catch (error: any) {
+    console.error('Error fetching unit by id:', error);
+    res.status(500).json({ error: 'Failed to fetch unit' });
+  }
+});
+
 // POST new unit
 router.post('/', async (req: Request, res: Response) => {
   try {

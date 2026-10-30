@@ -27,6 +27,35 @@ router.get('/', async (req: Request, res: Response) => {
   }
 });
 
+// GET customer by ID
+router.get('/:id', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const customer = await prisma.customer.findUnique({
+      where: { id },
+      include: {
+        invoices: true,
+        payments: true,
+        _count: {
+          select: {
+            invoices: true,
+            payments: true,
+          }
+        }
+      }
+    });
+
+    if (!customer) {
+      return res.status(404).json({ error: 'Customer not found' });
+    }
+
+    res.json(customer);
+  } catch (error: any) {
+    console.error('Error fetching customer by id:', error);
+    res.status(500).json({ error: 'Failed to fetch customer' });
+  }
+});
+
 // POST new customer
 router.post('/', async (req: Request, res: Response) => {
   try {
