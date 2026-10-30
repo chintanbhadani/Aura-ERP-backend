@@ -143,6 +143,17 @@ router.post('/cash-book/quick-entry', async (req: Request, res: Response) => {
           description: description || 'Payment to Supplier for Purchase'
         }
       });
+    } else if (type === 'OPENING_BALANCE' || type === 'CAPITAL_INFLOW') {
+      // Starting opening balance or capital inflow into store cash
+      createdPayment = await prisma.payment.create({
+        data: {
+          date: txDate,
+          paymentType: (paymentType as any) || 'CASH',
+          direction: 'IN',
+          amount: numAmount,
+          description: description || 'Starting Opening Balance / Capital Inflow'
+        }
+      });
     } else {
       createdPayment = await prisma.payment.create({
         data: {
@@ -328,11 +339,15 @@ router.get('/cash-book', async (req: Request, res: Response) => {
         const dir = pay.direction;
 
         const isBankTransfer = desc.includes('bank') || desc.includes('deposit') || desc.includes('withdraw');
+        const isOpeningCapital = desc.includes('opening balance') || desc.includes('capital') || desc.includes('starting balance');
 
         if (pType === 'CASH') {
           if (dir === 'IN') {
             if (isBankTransfer) {
               dayCashOutFromBank += amt; // Withdrawn from bank into cash
+            } else if (isOpeningCapital) {
+              // Direct capital / opening balance injection into store cash (without distorting credit receivables)
+              dayCashSales += amt;
             } else {
               dayReceivedCreditSale += amt; // Cash collected from client
             }
