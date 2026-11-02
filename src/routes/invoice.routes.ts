@@ -245,6 +245,36 @@ router.post('/', async (req: Request, res: Response) => {
       for (const item of items) {
         const quantityChange = type === 'PURCHASE' ? Number(item.quantity) : -Number(item.quantity);
         
+        // Ensure opening/initial stock is recorded in StockLedger if product has positive quantity but missing ledger entries
+        const currentProduct = await tx.product.findUnique({ where: { id: item.productId } });
+        if (currentProduct && currentProduct.quantity > 0) {
+          const ledgerAgg = await tx.stockLedger.aggregate({
+            where: { productId: item.productId },
+            _sum: { quantityChange: true },
+          });
+          const ledgerSum = ledgerAgg._sum.quantityChange || 0;
+          const diff = currentProduct.quantity - ledgerSum;
+          if (diff > 0) {
+            const initialDate = currentProduct.createdAt || new Date('2020-01-01');
+            await tx.stockLedger.create({
+              data: {
+                productId: item.productId,
+                date: initialDate,
+                type: 'INITIAL',
+                quantityChange: diff,
+                runningBalance: diff,
+                createdAt: initialDate,
+              },
+            });
+            await tx.$executeRaw`
+              UPDATE "StockLedger"
+              SET "runningBalance" = "runningBalance" + ${diff}
+              WHERE "productId" = ${item.productId}
+                AND date > ${initialDate}::TIMESTAMP
+            `;
+          }
+        }
+
         if (type === 'SALES') {
           // Check stock point-in-time and future
           const minBalanceResult: any = await tx.$queryRaw`

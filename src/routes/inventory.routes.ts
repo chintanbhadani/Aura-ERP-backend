@@ -337,7 +337,7 @@ router.post('/bulk-upload', upload.single('file'), async (req: Request, res: Res
         }
 
         // Upsert Product
-        await prisma.product.upsert({
+        const upsertedProduct = await prisma.product.upsert({
           where: { sku: row.sku.toString() },
           update: {
             name: row.name,
@@ -365,6 +365,29 @@ router.post('/bulk-upload', upload.single('file'), async (req: Request, res: Res
             status: row.status || 'Active',
           },
         });
+
+        // Ensure StockLedger tracks initial quantity
+        const initialQty = parseInt(row.quantity) || 0;
+        if (initialQty > 0) {
+          const ledgerAgg = await prisma.stockLedger.aggregate({
+            where: { productId: upsertedProduct.id },
+            _sum: { quantityChange: true },
+          });
+          const ledgerSum = ledgerAgg._sum.quantityChange || 0;
+          const diff = upsertedProduct.quantity - ledgerSum;
+          if (diff > 0) {
+            await prisma.stockLedger.create({
+              data: {
+                productId: upsertedProduct.id,
+                date: upsertedProduct.createdAt,
+                type: 'INITIAL',
+                quantityChange: diff,
+                runningBalance: diff,
+              },
+            });
+          }
+        }
+
         successCount++;
       } catch (err: any) {
         errors.push(`Row ${i + 2}: ${err.message}`);
