@@ -43,15 +43,15 @@ model Product {
   sku           String        @unique
   name          String
   quantity      Int           @default(0)
-  cost_price    Decimal       @db.Decimal(10, 2)
-  selling_price Decimal       @db.Decimal(10, 2)
+  cost_price    Decimal       @default(0) @db.Decimal(10, 2)
+  selling_price Decimal       @default(0) @db.Decimal(10, 2)
   min_stock     Int           @default(0)
   location      String?
   status        Status        @default(Active)
-  categoryId    String
-  category      Category      @relation(fields: [categoryId], references: [id])
-  supplierId    String
-  supplier      Supplier      @relation(fields: [supplierId], references: [id])
+  categoryId    String?
+  category      Category?     @relation(fields: [categoryId], references: [id])
+  supplierId    String?
+  supplier      Supplier?     @relation(fields: [supplierId], references: [id])
   invoiceDate   DateTime?
   unitId        String?
   unit          Unit?         @relation(fields: [unitId], references: [id])
@@ -114,6 +114,9 @@ model Invoice {
   bankAmount        Decimal       @default(0) @db.Decimal(10, 2)
   creditAmount      Decimal       @default(0) @db.Decimal(10, 2)
   mobileMoneyAmount Decimal?      @default(0) @db.Decimal(10, 2)
+  dueDate           DateTime?
+  notes             String?
+  paymentTerms      String?
   items             InvoiceItem[]
   stockLedgers      StockLedger[]
   payments          Payment[]
