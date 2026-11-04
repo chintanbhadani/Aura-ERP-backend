@@ -213,6 +213,41 @@ router.get('/:id', async (req: Request, res: Response) => {
   }
 });
 
+// Helper to ensure SKU uniqueness and auto-increment sequential codes if duplicate
+async function resolveUniqueSku(rawSku: string): Promise<string> {
+  let sku = (rawSku && rawSku.toString().trim()) || `SKU-${Date.now()}`;
+  const existing = await prisma.product.findUnique({ where: { sku } });
+  if (!existing) return sku;
+
+  const match = sku.match(/^(.*?)(\d+)$/);
+  if (match) {
+    const prefix = match[1];
+    const padLen = match[2].length;
+    const similar = await prisma.product.findMany({
+      where: { sku: { startsWith: prefix } },
+      select: { sku: true }
+    });
+    let maxNum = parseInt(match[2], 10);
+    const regex = new RegExp(`^${prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(\\d+)$`);
+    for (const item of similar) {
+      const m = item.sku.match(regex);
+      if (m) {
+        const num = parseInt(m[1], 10);
+        if (!isNaN(num) && num > maxNum) {
+          maxNum = num;
+        }
+      }
+    }
+    return `${prefix}${String(maxNum + 1).padStart(padLen, '0')}`;
+  }
+
+  let counter = 1;
+  while (await prisma.product.findUnique({ where: { sku: `${sku}-${counter}` } })) {
+    counter++;
+  }
+  return `${sku}-${counter}`;
+}
+
 // POST new item
 router.post('/', async (req: Request, res: Response) => {
   try {
@@ -224,7 +259,7 @@ router.post('/', async (req: Request, res: Response) => {
     }
 
     const name = data.name.toString().trim();
-    const sku = (data.sku && data.sku.toString().trim()) || `SKU-${Date.now()}`;
+    const sku = await resolveUniqueSku(data.sku);
     const cost_price = data.cost_price !== undefined && data.cost_price !== null && data.cost_price !== ''
       ? parseFloat(data.cost_price)
       : 0;

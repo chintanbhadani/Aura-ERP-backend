@@ -222,29 +222,131 @@ router.get('/:id', async (req, res) => {
         res.status(500).json({ error: 'Failed to fetch product' });
     }
 });
+// Helper to ensure SKU uniqueness and auto-increment sequential codes if duplicate
+async function resolveUniqueSku(rawSku) {
+    let sku = (rawSku && rawSku.toString().trim()) || `SKU-${Date.now()}`;
+    const existing = await prisma.product.findUnique({ where: { sku } });
+    if (!existing)
+        return sku;
+    const match = sku.match(/^(.*?)(\d+)$/);
+    if (match) {
+        const prefix = match[1];
+        const padLen = match[2].length;
+        const similar = await prisma.product.findMany({
+            where: { sku: { startsWith: prefix } },
+            select: { sku: true }
+        });
+        let maxNum = parseInt(match[2], 10);
+        const regex = new RegExp(`^${prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(\\d+)$`);
+        for (const item of similar) {
+            const m = item.sku.match(regex);
+            if (m) {
+                const num = parseInt(m[1], 10);
+                if (!isNaN(num) && num > maxNum) {
+                    maxNum = num;
+                }
+            }
+        }
+        return `${prefix}${String(maxNum + 1).padStart(padLen, '0')}`;
+    }
+    let counter = 1;
+    while (await prisma.product.findUnique({ where: { sku: `${sku}-${counter}` } })) {
+        counter++;
+    }
+    return `${sku}-${counter}`;
+}
 // POST new item
 router.post('/', async (req, res) => {
     try {
         const data = req.body;
-        // Basic validation
-        if (!data.sku || !data.name || !data.cost_price || !data.selling_price || !data.categoryId || !data.supplierId) {
-            return res.status(400).json({ error: 'Missing required fields' });
+        // Only item name is strictly required
+        if (!data.name || !data.name.toString().trim()) {
+            return res.status(400).json({ error: 'Item name is required' });
         }
-        const product = await prisma.product.create({
-            data: {
-                sku: data.sku,
-                name: data.name,
-                quantity: 0, // Force quantity to 0 on creation. Stock is managed via Purchase Invoices.
-                cost_price: parseFloat(data.cost_price),
-                selling_price: parseFloat(data.selling_price),
-                min_stock: parseInt(data.min_stock) || 0,
-                categoryId: data.categoryId,
-                supplierId: data.supplierId,
-                unitId: data.unitId || null,
-                invoiceDate: null, // Removed manual invoice dates
-                location: data.location || '',
-                status: data.status || 'Active',
-            },
+        const name = data.name.toString().trim();
+        const sku = await resolveUniqueSku(data.sku);
+        const cost_price = data.cost_price !== undefined && data.cost_price !== null && data.cost_price !== ''
+            ? parseFloat(data.cost_price)
+            : 0;
+        const selling_price = data.selling_price !== undefined && data.selling_price !== null && data.selling_price !== ''
+            ? parseFloat(data.selling_price)
+            : 0;
+        const min_stock = data.min_stock !== undefined && data.min_stock !== null && data.min_stock !== ''
+            ? parseInt(data.min_stock)
+            : 0;
+        const initialQty = data.quantity !== undefined && data.quantity !== null && data.quantity !== ''
+            ? parseInt(data.quantity)
+            : 0;
+        let categoryId = typeof data.categoryId === 'object' && data.categoryId ? data.categoryId.id : (data.categoryId || null);
+        if (!categoryId && data.categoryName) {
+            const cat = await prisma.category.findFirst({
+                where: { name: { equals: data.categoryName.trim(), mode: 'insensitive' } }
+            });
+            if (cat)
+                categoryId = cat.id;
+        }
+        let supplierId = typeof data.supplierId === 'object' && data.supplierId ? data.supplierId.id : (data.supplierId || null);
+        if (!supplierId) {
+            const defaultSupplier = await prisma.supplier.findFirst();
+            if (defaultSupplier)
+                supplierId = defaultSupplier.id;
+        }
+        const unitId = typeof data.unitId === 'object' && data.unitId ? data.unitId.id : (data.unitId || null);
+        const product = await prisma.$transaction(async (tx) => {
+            const created = await tx.product.create({
+                data: {
+                    sku,
+                    name,
+                    quantity: initialQty,
+                    cost_price: isNaN(cost_price) ? 0 : cost_price,
+                    selling_price: isNaN(selling_price) ? 0 : selling_price,
+                    min_stock: isNaN(min_stock) ? 0 : min_stock,
+                    categoryId: categoryId || null,
+                    supplierId: supplierId || null,
+                    unitId: unitId || null,
+                    invoiceDate: null,
+                    location: data.location || '',
+                    status: data.status || 'Active',
+                },
+                include: {
+                    category: true,
+                    supplier: true,
+                    unit: true
+                }
+            });
+            // Keep StockLedger in sync if initial quantity > 0
+            if (initialQty > 0) {
+                await tx.stockLedger.create({
+                    data: {
+                        productId: created.id,
+                        date: created.createdAt,
+                        quantityChange: initialQty,
+                        runningBalance: initialQty,
+                        type: 'INITIAL',
+                    }
+                });
+            }
+            // Keep SkuMaster in sync
+            try {
+                await tx.skuMaster.upsert({
+                    where: { sku: created.sku },
+                    update: {
+                        name: created.name,
+                        categoryId: created.categoryId,
+                        status: created.status
+                    },
+                    create: {
+                        name: created.name,
+                        sku: created.sku,
+                        categoryId: created.categoryId,
+                        status: created.status
+                    }
+                });
+            }
+            catch (err) {
+                console.warn('Could not sync SkuMaster:', err?.message);
+            }
+            return created;
         });
         res.status(201).json(product);
     }
@@ -252,7 +354,8 @@ router.post('/', async (req, res) => {
         if (error.code === 'P2002') {
             return res.status(409).json({ error: 'SKU must be unique' });
         }
-        res.status(500).json({ error: 'Failed to create product' });
+        console.error('Failed to create product:', error);
+        res.status(500).json({ error: error?.message || 'Failed to create product' });
     }
 });
 // PUT update item
@@ -260,27 +363,69 @@ router.put('/:id', async (req, res) => {
     try {
         const { id } = req.params;
         const data = req.body;
-        const product = await prisma.product.update({
-            where: { id },
-            data: {
-                sku: data.sku,
-                name: data.name,
-                quantity: data.quantity !== undefined ? parseInt(data.quantity) : undefined,
-                cost_price: data.cost_price !== undefined ? parseFloat(data.cost_price) : undefined,
-                selling_price: data.selling_price !== undefined ? parseFloat(data.selling_price) : undefined,
-                min_stock: data.min_stock !== undefined ? parseInt(data.min_stock) : undefined,
-                categoryId: data.categoryId,
-                supplierId: data.supplierId,
-                unitId: data.unitId || null,
-                invoiceDate: data.invoiceDate ? new Date(data.invoiceDate) : undefined,
-                location: data.location,
-                status: data.status,
-            },
+        const categoryId = data.categoryId !== undefined
+            ? (typeof data.categoryId === 'object' && data.categoryId ? data.categoryId.id : (data.categoryId || null))
+            : undefined;
+        const supplierId = data.supplierId !== undefined
+            ? (typeof data.supplierId === 'object' && data.supplierId ? data.supplierId.id : (data.supplierId || null))
+            : undefined;
+        const unitId = data.unitId !== undefined
+            ? (typeof data.unitId === 'object' && data.unitId ? data.unitId.id : (data.unitId || null))
+            : undefined;
+        const product = await prisma.$transaction(async (tx) => {
+            const updated = await tx.product.update({
+                where: { id },
+                data: {
+                    sku: data.sku !== undefined ? data.sku.toString().trim() : undefined,
+                    name: data.name !== undefined ? data.name.toString().trim() : undefined,
+                    quantity: data.quantity !== undefined && data.quantity !== null && data.quantity !== '' ? parseInt(data.quantity) : undefined,
+                    cost_price: data.cost_price !== undefined && data.cost_price !== null && data.cost_price !== '' ? parseFloat(data.cost_price) : undefined,
+                    selling_price: data.selling_price !== undefined && data.selling_price !== null && data.selling_price !== '' ? parseFloat(data.selling_price) : undefined,
+                    min_stock: data.min_stock !== undefined && data.min_stock !== null && data.min_stock !== '' ? parseInt(data.min_stock) : undefined,
+                    categoryId,
+                    supplierId,
+                    unitId,
+                    invoiceDate: data.invoiceDate ? new Date(data.invoiceDate) : undefined,
+                    location: data.location !== undefined ? data.location : undefined,
+                    status: data.status !== undefined ? data.status : undefined,
+                },
+                include: {
+                    category: true,
+                    supplier: true,
+                    unit: true
+                }
+            });
+            if (updated.sku) {
+                try {
+                    await tx.skuMaster.upsert({
+                        where: { sku: updated.sku },
+                        update: {
+                            name: updated.name,
+                            categoryId: updated.categoryId,
+                            status: updated.status
+                        },
+                        create: {
+                            name: updated.name,
+                            sku: updated.sku,
+                            categoryId: updated.categoryId,
+                            status: updated.status
+                        }
+                    });
+                }
+                catch (err) {
+                    console.warn('Could not sync SkuMaster on update:', err?.message);
+                }
+            }
+            return updated;
         });
         res.json(product);
     }
     catch (error) {
-        res.status(500).json({ error: 'Failed to update product' });
+        if (error.code === 'P2002') {
+            return res.status(409).json({ error: 'SKU must be unique' });
+        }
+        console.error('Failed to update product:', error);
+        res.status(500).json({ error: error?.message || 'Failed to update product' });
     }
 });
 // DELETE item
@@ -336,7 +481,7 @@ router.post('/bulk-upload', upload.single('file'), async (req, res) => {
                     }
                 }
                 // Upsert Product
-                await prisma.product.upsert({
+                const upsertedProduct = await prisma.product.upsert({
                     where: { sku: row.sku.toString() },
                     update: {
                         name: row.name,
@@ -364,6 +509,27 @@ router.post('/bulk-upload', upload.single('file'), async (req, res) => {
                         status: row.status || 'Active',
                     },
                 });
+                // Ensure StockLedger tracks initial quantity
+                const initialQty = parseInt(row.quantity) || 0;
+                if (initialQty > 0) {
+                    const ledgerAgg = await prisma.stockLedger.aggregate({
+                        where: { productId: upsertedProduct.id },
+                        _sum: { quantityChange: true },
+                    });
+                    const ledgerSum = ledgerAgg._sum.quantityChange || 0;
+                    const diff = upsertedProduct.quantity - ledgerSum;
+                    if (diff > 0) {
+                        await prisma.stockLedger.create({
+                            data: {
+                                productId: upsertedProduct.id,
+                                date: upsertedProduct.createdAt,
+                                type: 'INITIAL',
+                                quantityChange: diff,
+                                runningBalance: diff,
+                            },
+                        });
+                    }
+                }
                 successCount++;
             }
             catch (err) {

@@ -196,7 +196,7 @@ router.get('/:id', async (req, res) => {
 // POST create new invoice
 router.post('/', async (req, res) => {
     try {
-        const { type, date, customerId, supplierId, items, paymentType, cashAmount, bankAmount, creditAmount, mobileMoneyAmount } = req.body;
+        const { type, date, dueDate, notes, paymentTerms, customerId, supplierId, items, paymentType, cashAmount, bankAmount, creditAmount, mobileMoneyAmount } = req.body;
         if (!type || !items || !items.length) {
             return res.status(400).json({ error: 'Type and items are required' });
         }
@@ -214,6 +214,35 @@ router.post('/', async (req, res) => {
             // 1. Verify chronological stock (The "Future-Dip" check)
             for (const item of items) {
                 const quantityChange = type === 'PURCHASE' ? Number(item.quantity) : -Number(item.quantity);
+                // Ensure opening/initial stock is recorded in StockLedger if product has positive quantity but missing ledger entries
+                const currentProduct = await tx.product.findUnique({ where: { id: item.productId } });
+                if (currentProduct && currentProduct.quantity > 0) {
+                    const ledgerAgg = await tx.stockLedger.aggregate({
+                        where: { productId: item.productId },
+                        _sum: { quantityChange: true },
+                    });
+                    const ledgerSum = ledgerAgg._sum.quantityChange || 0;
+                    const diff = currentProduct.quantity - ledgerSum;
+                    if (diff > 0) {
+                        const initialDate = currentProduct.createdAt || new Date('2020-01-01');
+                        await tx.stockLedger.create({
+                            data: {
+                                productId: item.productId,
+                                date: initialDate,
+                                type: 'INITIAL',
+                                quantityChange: diff,
+                                runningBalance: diff,
+                                createdAt: initialDate,
+                            },
+                        });
+                        await tx.$executeRaw `
+              UPDATE "StockLedger"
+              SET "runningBalance" = "runningBalance" + ${diff}
+              WHERE "productId" = ${item.productId}
+                AND date > ${initialDate}::TIMESTAMP
+            `;
+                    }
+                }
                 if (type === 'SALES') {
                     // Check stock point-in-time and future
                     const minBalanceResult = await tx.$queryRaw `
@@ -253,6 +282,9 @@ router.post('/', async (req, res) => {
                     invoiceNumber,
                     type,
                     date: invoiceDate,
+                    dueDate: dueDate ? new Date(dueDate) : null,
+                    notes: notes || null,
+                    paymentTerms: paymentTerms || null,
                     totalAmount,
                     customerId: type === 'SALES' ? customerId : null,
                     supplierId: type === 'PURCHASE' ? supplierId : null,
@@ -373,6 +405,33 @@ router.post('/', async (req, res) => {
             UPDATE "CashLedger"
             SET "runningBalance" = "runningBalance" + ${bankQuantityChange}
             WHERE "paymentType" = 'BANK'
+              AND date > ${invoiceDate}::TIMESTAMP
+        `;
+            }
+            if (finalMobileMoneyAmount > 0) {
+                const mmQuantityChange = type === 'SALES' ? finalMobileMoneyAmount : -finalMobileMoneyAmount;
+                const currentMMBalanceResult = await tx.$queryRaw `
+          SELECT COALESCE(SUM("amountChange"), 0) AS balance_before
+          FROM "CashLedger"
+          WHERE "paymentType" = 'MOBILE_MONEY'
+            AND date < ${invoiceDate}::TIMESTAMP
+        `;
+                const mmBalanceBefore = currentMMBalanceResult[0]?.balance_before ? Number(currentMMBalanceResult[0].balance_before) : 0;
+                const newMMRunningBalance = mmBalanceBefore + mmQuantityChange;
+                await tx.cashLedger.create({
+                    data: {
+                        date: invoiceDate,
+                        paymentType: 'MOBILE_MONEY',
+                        sourceType: type === 'SALES' ? 'SALE' : 'PURCHASE',
+                        amountChange: mmQuantityChange,
+                        runningBalance: newMMRunningBalance,
+                        invoiceId: invoice.id,
+                    }
+                });
+                await tx.$queryRaw `
+            UPDATE "CashLedger"
+            SET "runningBalance" = "runningBalance" + ${mmQuantityChange}
+            WHERE "paymentType" = 'MOBILE_MONEY'
               AND date > ${invoiceDate}::TIMESTAMP
         `;
             }
