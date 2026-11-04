@@ -145,4 +145,68 @@ router.post('/bulk-upload', upload.single('file'), async (req: Request, res: Res
   }
 });
 
+// POST bulk import categories (JSON array)
+router.post('/bulk-import', async (req: Request, res: Response) => {
+  try {
+    const { items } = req.body;
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: 'Items array is required' });
+    }
+
+    let successCount = 0;
+    let createdCount = 0;
+    let updatedCount = 0;
+    const errors: string[] = [];
+
+    for (let i = 0; i < items.length; i++) {
+      const row = items[i];
+      try {
+        const name = (row.name || row.categoryName || row['Item Group Name'] || row.itemGroup || '').toString().trim();
+        if (!name) {
+          errors.push(`Row ${i + 1}: Missing name`);
+          continue;
+        }
+
+        const disabledVal = row.disabled ?? row['Disabled'] ?? row.isDisabled;
+        const disabled = typeof disabledVal === 'string'
+          ? ['yes', 'true', '1'].includes(disabledVal.trim().toLowerCase())
+          : Boolean(disabledVal);
+        const status = disabled ? 'Inactive' : 'Active';
+
+        const existing = await prisma.category.findFirst({
+          where: { name: { equals: name, mode: 'insensitive' } }
+        });
+
+        if (existing) {
+          await prisma.category.update({
+            where: { id: existing.id },
+            data: { status }
+          });
+          updatedCount++;
+        } else {
+          await prisma.category.create({
+            data: { name, status }
+          });
+          createdCount++;
+        }
+        successCount++;
+      } catch (err: any) {
+        errors.push(`Row ${i + 1}: ${err.message}`);
+      }
+    }
+
+    res.json({
+      message: `Successfully processed ${successCount} item groups (${createdCount} created, ${updatedCount} updated).`,
+      count: successCount,
+      successCount,
+      createdCount,
+      updatedCount,
+      errors
+    });
+  } catch (error: any) {
+    console.error('Failed to bulk import categories:', error);
+    res.status(500).json({ error: error.message || 'Failed to bulk import categories' });
+  }
+});
+
 export default router;

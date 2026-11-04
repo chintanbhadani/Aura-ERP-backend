@@ -158,31 +158,59 @@ router.post('/bulk-import', async (req: Request, res: Response) => {
     }
 
     let successCount = 0;
+    let createdCount = 0;
+    let updatedCount = 0;
     const errors: string[] = [];
 
     for (let i = 0; i < items.length; i++) {
       const row = items[i];
       try {
-        const name = row.name || row['Customer Name'] || row.customerName || row['Client Name'];
+        const name = (row.name || row['Customer Name'] || row.customerName || row['Client Name'] || row.companyName || '').toString().trim();
         if (!name) {
           errors.push(`Row ${i + 1}: Missing name`);
           continue;
         }
 
-        await prisma.customer.create({
-          data: {
-            name: String(name).trim(),
-            contact: row.contact || row.phone ? String(row.contact || row.phone) : null,
-            email: row.email ? String(row.email) : null
-          }
+        const contact = (row.contact || row.phone || row['Phone / Contact'] || '').toString().trim() || null;
+        const email = (row.email || row['Email'] || '').toString().trim() || null;
+
+        const existing = await prisma.customer.findFirst({
+          where: { name: { equals: name, mode: 'insensitive' } }
         });
+
+        if (existing) {
+          await prisma.customer.update({
+            where: { id: existing.id },
+            data: {
+              contact: contact || existing.contact,
+              email: email || existing.email,
+            }
+          });
+          updatedCount++;
+        } else {
+          await prisma.customer.create({
+            data: {
+              name,
+              contact,
+              email
+            }
+          });
+          createdCount++;
+        }
         successCount++;
       } catch (err: any) {
         errors.push(`Row ${i + 1}: ${err.message}`);
       }
     }
 
-    res.json({ message: `Successfully imported ${successCount} customers.`, count: successCount, errors });
+    res.json({
+      message: `Successfully processed ${successCount} customers (${createdCount} created, ${updatedCount} updated).`,
+      count: successCount,
+      successCount,
+      createdCount,
+      updatedCount,
+      errors
+    });
   } catch (error: any) {
     res.status(500).json({ error: error.message || 'Failed to bulk import customers' });
   }

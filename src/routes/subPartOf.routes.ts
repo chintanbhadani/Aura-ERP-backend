@@ -109,12 +109,14 @@ router.post('/bulk-import', async (req: Request, res: Response) => {
     }
 
     let successCount = 0;
+    let createdCount = 0;
+    let updatedCount = 0;
     const errors: string[] = [];
 
     for (let i = 0; i < items.length; i++) {
       const row = items[i];
       try {
-        const name = row.name || row['Sub Part Of Name'] || row.subPartOfName;
+        const name = (row.name || row['Sub Part Of Name'] || row.subPartOfName || '').toString().trim();
         if (!name) {
           errors.push(`Row ${i + 1}: Missing name`);
           continue;
@@ -125,19 +127,39 @@ router.post('/bulk-import', async (req: Request, res: Response) => {
           ? ['yes', 'true', '1'].includes(disabledVal.trim().toLowerCase())
           : Boolean(disabledVal);
 
-        await prisma.subPartOf.create({
-          data: {
-            name: String(name).trim(),
-            disabled,
-          },
+        const existing = await prisma.subPartOf.findFirst({
+          where: { name: { equals: name, mode: 'insensitive' } }
         });
+
+        if (existing) {
+          await prisma.subPartOf.update({
+            where: { id: existing.id },
+            data: { disabled }
+          });
+          updatedCount++;
+        } else {
+          await prisma.subPartOf.create({
+            data: {
+              name,
+              disabled,
+            },
+          });
+          createdCount++;
+        }
         successCount++;
       } catch (err: any) {
         errors.push(`Row ${i + 1}: ${err.message}`);
       }
     }
 
-    res.json({ message: `Successfully imported ${successCount} records.`, count: successCount, errors });
+    res.json({
+      message: `Successfully processed ${successCount} records (${createdCount} created, ${updatedCount} updated).`,
+      count: successCount,
+      successCount,
+      createdCount,
+      updatedCount,
+      errors
+    });
   } catch (error: any) {
     console.error('Error bulk importing SubPartOf:', error);
     res.status(500).json({ error: error.message || 'Failed to bulk import SubPartOf' });

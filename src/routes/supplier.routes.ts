@@ -151,4 +151,79 @@ router.post('/bulk-upload', upload.single('file'), async (req: Request, res: Res
   }
 });
 
+// POST bulk import suppliers (JSON array)
+router.post('/bulk-import', async (req: Request, res: Response) => {
+  try {
+    const { items } = req.body;
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: 'Items array is required' });
+    }
+
+    let successCount = 0;
+    let createdCount = 0;
+    let updatedCount = 0;
+    const errors: string[] = [];
+
+    for (let i = 0; i < items.length; i++) {
+      const row = items[i];
+      try {
+        const name = (row.name || row.supplierName || row['Supplier Name'] || '').toString().trim();
+        if (!name) {
+          errors.push(`Row ${i + 1}: Missing name`);
+          continue;
+        }
+
+        const contact = (row.contact || row.phone || row['Phone / Contact'] || '').toString().trim() || null;
+        const email = (row.email || row['Email'] || '').toString().trim() || null;
+        const disabledVal = row.disabled ?? row['Disabled'] ?? row.isDisabled;
+        const disabled = typeof disabledVal === 'string'
+          ? ['yes', 'true', '1'].includes(disabledVal.trim().toLowerCase())
+          : Boolean(disabledVal);
+        const status = disabled ? 'Inactive' : 'Active';
+
+        const existing = await prisma.supplier.findFirst({
+          where: { name: { equals: name, mode: 'insensitive' } }
+        });
+
+        if (existing) {
+          await prisma.supplier.update({
+            where: { id: existing.id },
+            data: {
+              contact: contact || existing.contact,
+              email: email || existing.email,
+              status
+            }
+          });
+          updatedCount++;
+        } else {
+          await prisma.supplier.create({
+            data: {
+              name,
+              contact,
+              email,
+              status
+            }
+          });
+          createdCount++;
+        }
+        successCount++;
+      } catch (err: any) {
+        errors.push(`Row ${i + 1}: ${err.message}`);
+      }
+    }
+
+    res.json({
+      message: `Successfully processed ${successCount} suppliers (${createdCount} created, ${updatedCount} updated).`,
+      count: successCount,
+      successCount,
+      createdCount,
+      updatedCount,
+      errors
+    });
+  } catch (error: any) {
+    console.error('Failed to bulk import suppliers:', error);
+    res.status(500).json({ error: error.message || 'Failed to bulk import suppliers' });
+  }
+});
+
 export default router;

@@ -141,4 +141,68 @@ router.post('/bulk-upload', upload.single('file'), async (req: Request, res: Res
   }
 });
 
+// POST bulk import units (JSON array)
+router.post('/bulk-import', async (req: Request, res: Response) => {
+  try {
+    const { items } = req.body;
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: 'Items array is required' });
+    }
+
+    let successCount = 0;
+    let createdCount = 0;
+    let updatedCount = 0;
+    const errors: string[] = [];
+
+    for (let i = 0; i < items.length; i++) {
+      const row = items[i];
+      try {
+        const name = (row.name || row.unitName || row['Unit Name'] || row.uom || '').toString().trim();
+        if (!name) {
+          errors.push(`Row ${i + 1}: Missing name`);
+          continue;
+        }
+
+        const disabledVal = row.disabled ?? row['Disabled'] ?? row.isDisabled;
+        const disabled = typeof disabledVal === 'string'
+          ? ['yes', 'true', '1'].includes(disabledVal.trim().toLowerCase())
+          : Boolean(disabledVal);
+        const status = disabled ? 'Inactive' : 'Active';
+
+        const existing = await prisma.unit.findFirst({
+          where: { name: { equals: name, mode: 'insensitive' } }
+        });
+
+        if (existing) {
+          await prisma.unit.update({
+            where: { id: existing.id },
+            data: { status }
+          });
+          updatedCount++;
+        } else {
+          await prisma.unit.create({
+            data: { name, status }
+          });
+          createdCount++;
+        }
+        successCount++;
+      } catch (err: any) {
+        errors.push(`Row ${i + 1}: ${err.message}`);
+      }
+    }
+
+    res.json({
+      message: `Successfully processed ${successCount} units (${createdCount} created, ${updatedCount} updated).`,
+      count: successCount,
+      successCount,
+      createdCount,
+      updatedCount,
+      errors
+    });
+  } catch (error: any) {
+    console.error('Failed to bulk import units:', error);
+    res.status(500).json({ error: error.message || 'Failed to bulk import units' });
+  }
+});
+
 export default router;

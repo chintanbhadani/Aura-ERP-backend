@@ -557,4 +557,238 @@ router.post('/bulk-upload', upload.single('file'), async (req: Request, res: Res
   }
 });
 
+// POST bulk import items (JSON)
+router.post('/bulk-import', async (req: Request, res: Response) => {
+  try {
+    const { items } = req.body;
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: 'Items array is required' });
+    }
+
+    let successCount = 0;
+    let createdCount = 0;
+    let updatedCount = 0;
+    const errors: string[] = [];
+
+    const defaultSupplier = await prisma.supplier.findFirst();
+
+    for (let i = 0; i < items.length; i++) {
+      const row = items[i];
+      try {
+        const name = (row.name || row.itemName || row['Item Name'] || '').toString().trim();
+        if (!name) {
+          errors.push(`Row ${i + 1}: Item Name is required`);
+          continue;
+        }
+
+        // Resolve Category
+        let categoryId = row.categoryId || null;
+        const catName = (row.category || row.categoryName || row.itemGroup || row['Item Group'] || '').toString().trim();
+        if (!categoryId && catName) {
+          let cat = await prisma.category.findFirst({
+            where: { name: { equals: catName, mode: 'insensitive' } }
+          });
+          if (!cat) {
+            cat = await prisma.category.create({ data: { name: catName, status: 'Active' } });
+          }
+          categoryId = cat.id;
+        }
+
+        // Resolve Unit
+        let unitId = row.unitId || null;
+        const uomName = (row.uom || row.unit || row.unitName || row['Default Unit of Measure'] || '').toString().trim();
+        if (!unitId && uomName) {
+          let un = await prisma.unit.findFirst({
+            where: { name: { equals: uomName, mode: 'insensitive' } }
+          });
+          if (!un) {
+            un = await prisma.unit.create({ data: { name: uomName, status: 'Active' } });
+          }
+          unitId = un.id;
+        }
+
+        // Resolve Supplier
+        let supplierId = row.supplierId || null;
+        const supName = (row.supplier || row.supplierName || '').toString().trim();
+        if (!supplierId && supName) {
+          let sup = await prisma.supplier.findFirst({
+            where: { name: { equals: supName, mode: 'insensitive' } }
+          });
+          if (!sup) {
+            sup = await prisma.supplier.create({ data: { name: supName, status: 'Active' } });
+          }
+          supplierId = sup.id;
+        }
+        if (!supplierId && defaultSupplier) {
+          supplierId = defaultSupplier.id;
+        }
+
+        // Numeric fields
+        const cost_price = row.cost_price !== undefined && row.cost_price !== null && row.cost_price !== ''
+          ? parseFloat(row.cost_price)
+          : (row.costPrice !== undefined ? parseFloat(row.costPrice) : 0);
+        const selling_price = row.selling_price !== undefined && row.selling_price !== null && row.selling_price !== ''
+          ? parseFloat(row.selling_price)
+          : (row.sellingPrice !== undefined ? parseFloat(row.sellingPrice) : 0);
+        const min_stock = row.min_stock !== undefined && row.min_stock !== null && row.min_stock !== ''
+          ? parseInt(row.min_stock)
+          : (row.minStock !== undefined ? parseInt(row.minStock) : 0);
+        const quantity = row.quantity !== undefined && row.quantity !== null && row.quantity !== ''
+          ? parseInt(row.quantity)
+          : (row.qty !== undefined ? parseInt(row.qty) : 0);
+
+        const location = (row.location || row.binLocation || row['Bin Location'] || '').toString().trim();
+        const status = row.status === 'Inactive' || row.disabled === true || row.disabled === 'Yes' ? 'Inactive' : 'Active';
+
+        // Resolve SKU
+        let rawSku = (row.sku || row.itemCode || row['Item Code (SKU)'] || '').toString().trim();
+        let targetProduct: any = null;
+
+        if (rawSku) {
+          const existing = await prisma.product.findUnique({ where: { sku: rawSku } });
+          if (existing) {
+            if (existing.name.trim().toLowerCase() === name.toLowerCase()) {
+              // Same item, update it
+              targetProduct = await prisma.product.update({
+                where: { id: existing.id },
+                data: {
+                  name,
+                  quantity: isNaN(quantity) ? existing.quantity : quantity,
+                  cost_price: isNaN(cost_price) ? existing.cost_price : cost_price,
+                  selling_price: isNaN(selling_price) ? existing.selling_price : selling_price,
+                  min_stock: isNaN(min_stock) ? existing.min_stock : min_stock,
+                  categoryId: categoryId || existing.categoryId,
+                  supplierId: supplierId || existing.supplierId,
+                  unitId: unitId || existing.unitId,
+                  location: location || existing.location,
+                  status: status || existing.status,
+                }
+              });
+              updatedCount++;
+            } else {
+              // Name differs: collision on demo SKU, auto-increment to unique SKU
+              const uniqueSku = await resolveUniqueSku(rawSku);
+              targetProduct = await prisma.product.create({
+                data: {
+                  sku: uniqueSku,
+                  name,
+                  quantity: isNaN(quantity) ? 0 : quantity,
+                  cost_price: isNaN(cost_price) ? 0 : cost_price,
+                  selling_price: isNaN(selling_price) ? 0 : selling_price,
+                  min_stock: isNaN(min_stock) ? 0 : min_stock,
+                  categoryId: categoryId || null,
+                  supplierId: supplierId || null,
+                  unitId: unitId || null,
+                  location,
+                  status,
+                }
+              });
+              createdCount++;
+            }
+          } else {
+            // New SKU
+            targetProduct = await prisma.product.create({
+              data: {
+                sku: rawSku,
+                name,
+                quantity: isNaN(quantity) ? 0 : quantity,
+                cost_price: isNaN(cost_price) ? 0 : cost_price,
+                selling_price: isNaN(selling_price) ? 0 : selling_price,
+                min_stock: isNaN(min_stock) ? 0 : min_stock,
+                categoryId: categoryId || null,
+                supplierId: supplierId || null,
+                unitId: unitId || null,
+                location,
+                status,
+              }
+            });
+            createdCount++;
+          }
+        } else {
+          // No SKU provided, generate one
+          const uniqueSku = await resolveUniqueSku(`SKU-${Date.now()}`);
+          targetProduct = await prisma.product.create({
+            data: {
+              sku: uniqueSku,
+              name,
+              quantity: isNaN(quantity) ? 0 : quantity,
+              cost_price: isNaN(cost_price) ? 0 : cost_price,
+              selling_price: isNaN(selling_price) ? 0 : selling_price,
+              min_stock: isNaN(min_stock) ? 0 : min_stock,
+              categoryId: categoryId || null,
+              supplierId: supplierId || null,
+              unitId: unitId || null,
+              location,
+              status,
+            }
+          });
+          createdCount++;
+        }
+
+        // Sync SkuMaster
+        if (targetProduct) {
+          try {
+            await prisma.skuMaster.upsert({
+              where: { sku: targetProduct.sku },
+              update: {
+                name: targetProduct.name,
+                categoryId: targetProduct.categoryId,
+                status: targetProduct.status
+              },
+              create: {
+                name: targetProduct.name,
+                sku: targetProduct.sku,
+                categoryId: targetProduct.categoryId,
+                status: targetProduct.status
+              }
+            });
+          } catch (e: any) {
+            console.warn('SkuMaster sync warning:', e?.message);
+          }
+
+          // Initial stock ledger tracking
+          if (targetProduct.quantity > 0) {
+            try {
+              const ledgerAgg = await prisma.stockLedger.aggregate({
+                where: { productId: targetProduct.id },
+                _sum: { quantityChange: true },
+              });
+              const ledgerSum = ledgerAgg._sum.quantityChange || 0;
+              const diff = targetProduct.quantity - ledgerSum;
+              if (diff > 0) {
+                await prisma.stockLedger.create({
+                  data: {
+                    productId: targetProduct.id,
+                    date: targetProduct.createdAt || new Date(),
+                    type: 'INITIAL',
+                    quantityChange: diff,
+                    runningBalance: targetProduct.quantity,
+                  },
+                });
+              }
+            } catch (e: any) {
+              console.warn('StockLedger sync warning:', e?.message);
+            }
+          }
+        }
+
+        successCount++;
+      } catch (err: any) {
+        errors.push(`Row ${i + 1}: ${err.message}`);
+      }
+    }
+
+    res.json({
+      message: `Successfully processed ${successCount} items (${createdCount} created, ${updatedCount} updated).`,
+      successCount,
+      createdCount,
+      updatedCount,
+      errors
+    });
+  } catch (error: any) {
+    console.error('Failed to bulk import products:', error);
+    res.status(500).json({ error: error.message || 'Failed to bulk import products' });
+  }
+});
+
 export default router;

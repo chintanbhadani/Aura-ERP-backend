@@ -1,6 +1,9 @@
 .env
 /.env
+dist
 dist/
+/dist
+/dist/
 build/
 uploads/
 dailyBackups
