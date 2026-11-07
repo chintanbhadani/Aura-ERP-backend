@@ -10,7 +10,10 @@
     "postinstall": "prisma generate",
     "db:push": "prisma db push",
     "db:migrate": "prisma migrate deploy",
-    "db:migrate:dev": "prisma migrate dev"
+    "db:migrate:dev": "prisma migrate dev",
+    "db:clear": "node scripts/clear-test-data.js",
+    "db:clear:all": "node scripts/clear-test-data.js --all",
+    "db:wipe": "node scripts/clear-test-data.js --wipe-all"
   },
   "dependencies": {
     "@prisma/client": "^5.22.0",
