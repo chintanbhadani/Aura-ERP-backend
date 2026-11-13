@@ -57,6 +57,8 @@ model Product {
   unit          Unit?         @relation(fields: [unitId], references: [id])
   invoiceItems  InvoiceItem[]
   stockLedgers  StockLedger[]
+  repackSources RepackEntry[] @relation("RepackSource")
+  repackTargets RepackEntry[] @relation("RepackTarget")
   createdAt     DateTime      @default(now())
   updatedAt     DateTime      @updatedAt
 }
@@ -248,4 +250,30 @@ model CashBookConfig {
   initialOpeningAirtel Decimal  @default(0) @db.Decimal(12, 2)
   notes                String?
   updatedAt            DateTime @updatedAt
+}
+
+model RepackEntry {
+  id              String   @id @default(uuid())
+  repackNumber    String   @unique
+  date            DateTime @default(now())
+  
+  sourceProductId String
+  sourceProduct   Product  @relation("RepackSource", fields: [sourceProductId], references: [id])
+  sourceQuantity  Decimal  @db.Decimal(10, 2)
+  
+  targetProductId String
+  targetProduct   Product  @relation("RepackTarget", fields: [targetProductId], references: [id])
+  targetQuantity  Decimal  @db.Decimal(10, 2)
+  
+  purchaseItemId    String?
+  purchaseInvoiceNo String?
+  poAllocations     Json?
+  
+  packagingCost   Decimal? @default(0) @db.Decimal(10, 2)
+  calculatedCost  Decimal? @default(0) @db.Decimal(10, 2)
+  notes           String?
+  status          String   @default("Completed")
+  
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
 }
