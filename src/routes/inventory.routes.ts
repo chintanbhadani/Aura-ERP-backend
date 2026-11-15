@@ -82,7 +82,9 @@ router.get('/', async (req: Request, res: Response) => {
       include: {
         category: true,
         supplier: true,
-        unit: true
+        unit: true,
+        partOf: true,
+        subPartOf: true,
       },
       orderBy: { updatedAt: 'desc' }
     });
@@ -189,7 +191,9 @@ router.get('/:id', async (req: Request, res: Response) => {
       include: {
         category: true,
         supplier: true,
-        unit: true
+        unit: true,
+        partOf: true,
+        subPartOf: true,
       },
     });
     if (!product) {
@@ -289,6 +293,36 @@ router.post('/', async (req: Request, res: Response) => {
 
     const unitId = typeof data.unitId === 'object' && data.unitId ? data.unitId.id : (data.unitId || null);
 
+    // Resolve partOf
+    let partOfId = typeof data.partOfId === 'object' && data.partOfId ? data.partOfId.id : (data.partOfId || null);
+    if (!partOfId && data.partOf) {
+      const partName = (typeof data.partOf === 'object' && data.partOf ? data.partOf.name : data.partOf.toString()).trim();
+      if (partName) {
+        let part = await prisma.partOf.findFirst({
+          where: { name: { equals: partName, mode: 'insensitive' } }
+        });
+        if (!part) {
+          part = await prisma.partOf.create({ data: { name: partName } });
+        }
+        partOfId = part.id;
+      }
+    }
+
+    // Resolve subPartOf
+    let subPartOfId = typeof data.subPartOfId === 'object' && data.subPartOfId ? data.subPartOfId.id : (data.subPartOfId || null);
+    if (!subPartOfId && data.subPartOf) {
+      const subPartName = (typeof data.subPartOf === 'object' && data.subPartOf ? data.subPartOf.name : data.subPartOf.toString()).trim();
+      if (subPartName) {
+        let subPart = await prisma.subPartOf.findFirst({
+          where: { name: { equals: subPartName, mode: 'insensitive' } }
+        });
+        if (!subPart) {
+          subPart = await prisma.subPartOf.create({ data: { name: subPartName } });
+        }
+        subPartOfId = subPart.id;
+      }
+    }
+
     const product = await prisma.$transaction(async (tx) => {
       const created = await tx.product.create({
         data: {
@@ -301,6 +335,8 @@ router.post('/', async (req: Request, res: Response) => {
           categoryId: categoryId || null,
           supplierId: supplierId || null,
           unitId: unitId || null,
+          partOfId: partOfId || null,
+          subPartOfId: subPartOfId || null,
           invoiceDate: null,
           location: data.location || '',
           status: data.status || 'Active',
@@ -310,7 +346,9 @@ router.post('/', async (req: Request, res: Response) => {
         include: {
           category: true,
           supplier: true,
-          unit: true
+          unit: true,
+          partOf: true,
+          subPartOf: true
         }
       });
 
@@ -376,6 +414,52 @@ router.put('/:id', async (req: Request, res: Response) => {
       ? (typeof data.unitId === 'object' && data.unitId ? data.unitId.id : (data.unitId || null))
       : undefined;
 
+    let partOfId: string | null | undefined = undefined;
+    if (data.partOfId !== undefined) {
+      partOfId = typeof data.partOfId === 'object' && data.partOfId ? data.partOfId.id : (data.partOfId || null);
+    }
+    if (partOfId === undefined && data.partOf !== undefined) {
+      if (!data.partOf) {
+        partOfId = null;
+      } else {
+        const partName = (typeof data.partOf === 'object' && data.partOf ? data.partOf.name : data.partOf.toString()).trim();
+        if (partName) {
+          let part = await prisma.partOf.findFirst({
+            where: { name: { equals: partName, mode: 'insensitive' } }
+          });
+          if (!part) {
+            part = await prisma.partOf.create({ data: { name: partName } });
+          }
+          partOfId = part.id;
+        } else {
+          partOfId = null;
+        }
+      }
+    }
+
+    let subPartOfId: string | null | undefined = undefined;
+    if (data.subPartOfId !== undefined) {
+      subPartOfId = typeof data.subPartOfId === 'object' && data.subPartOfId ? data.subPartOfId.id : (data.subPartOfId || null);
+    }
+    if (subPartOfId === undefined && data.subPartOf !== undefined) {
+      if (!data.subPartOf) {
+        subPartOfId = null;
+      } else {
+        const subPartName = (typeof data.subPartOf === 'object' && data.subPartOf ? data.subPartOf.name : data.subPartOf.toString()).trim();
+        if (subPartName) {
+          let subPart = await prisma.subPartOf.findFirst({
+            where: { name: { equals: subPartName, mode: 'insensitive' } }
+          });
+          if (!subPart) {
+            subPart = await prisma.subPartOf.create({ data: { name: subPartName } });
+          }
+          subPartOfId = subPart.id;
+        } else {
+          subPartOfId = null;
+        }
+      }
+    }
+
     const product = await prisma.$transaction(async (tx) => {
       const updated = await tx.product.update({
         where: { id },
@@ -389,6 +473,8 @@ router.put('/:id', async (req: Request, res: Response) => {
           categoryId,
           supplierId,
           unitId,
+          partOfId,
+          subPartOfId,
           invoiceDate: data.invoiceDate ? new Date(data.invoiceDate) : undefined,
           location: data.location !== undefined ? data.location : undefined,
           status: data.status !== undefined ? data.status : undefined,
@@ -398,7 +484,9 @@ router.put('/:id', async (req: Request, res: Response) => {
         include: {
           category: true,
           supplier: true,
-          unit: true
+          unit: true,
+          partOf: true,
+          subPartOf: true
         }
       });
 
@@ -496,6 +584,30 @@ router.post('/bulk-upload', upload.single('file'), async (req: Request, res: Res
           }
         }
 
+        // Find or create PartOf
+        let partOf = null;
+        const partOfName = (row.partOf || row['Part Of'] || row.part_of || row.partName || '').toString().trim();
+        if (partOfName) {
+          partOf = await prisma.partOf.findFirst({
+            where: { name: { equals: partOfName, mode: 'insensitive' } }
+          });
+          if (!partOf) {
+            partOf = await prisma.partOf.create({ data: { name: partOfName } });
+          }
+        }
+
+        // Find or create SubPartOf
+        let subPartOf = null;
+        const subPartOfName = (row.subPartOf || row['Sub Part Of'] || row.sub_part_of || row.subPartName || '').toString().trim();
+        if (subPartOfName) {
+          subPartOf = await prisma.subPartOf.findFirst({
+            where: { name: { equals: subPartOfName, mode: 'insensitive' } }
+          });
+          if (!subPartOf) {
+            subPartOf = await prisma.subPartOf.create({ data: { name: subPartOfName } });
+          }
+        }
+
         // Upsert Product
         const upsertedProduct = await prisma.product.upsert({
           where: { sku: row.sku.toString() },
@@ -508,6 +620,8 @@ router.post('/bulk-upload', upload.single('file'), async (req: Request, res: Res
             categoryId: category.id,
             supplierId: supplier.id,
             unitId: unit?.id || null,
+            partOfId: partOf?.id || undefined,
+            subPartOfId: subPartOf?.id || undefined,
             location: row.location || '',
             status: row.status || 'Active',
           },
@@ -521,6 +635,8 @@ router.post('/bulk-upload', upload.single('file'), async (req: Request, res: Res
             categoryId: category.id,
             supplierId: supplier.id,
             unitId: unit?.id || null,
+            partOfId: partOf?.id || null,
+            subPartOfId: subPartOf?.id || null,
             location: row.location || '',
             status: row.status || 'Active',
           },
@@ -627,6 +743,32 @@ router.post('/bulk-import', async (req: Request, res: Response) => {
           supplierId = defaultSupplier.id;
         }
 
+        // Resolve Part Of
+        let partOfId = row.partOfId || null;
+        const partName = (row.partOf || row.part_of || row['Part Of'] || row.partName || '').toString().trim();
+        if (!partOfId && partName) {
+          let part = await prisma.partOf.findFirst({
+            where: { name: { equals: partName, mode: 'insensitive' } }
+          });
+          if (!part) {
+            part = await prisma.partOf.create({ data: { name: partName } });
+          }
+          partOfId = part.id;
+        }
+
+        // Resolve Sub Part Of
+        let subPartOfId = row.subPartOfId || null;
+        const subPartName = (row.subPartOf || row.sub_part_of || row['Sub Part Of'] || row.subPartName || '').toString().trim();
+        if (!subPartOfId && subPartName) {
+          let subPart = await prisma.subPartOf.findFirst({
+            where: { name: { equals: subPartName, mode: 'insensitive' } }
+          });
+          if (!subPart) {
+            subPart = await prisma.subPartOf.create({ data: { name: subPartName } });
+          }
+          subPartOfId = subPart.id;
+        }
+
         // Numeric fields
         const cost_price = row.cost_price !== undefined && row.cost_price !== null && row.cost_price !== ''
           ? parseFloat(row.cost_price)
@@ -664,6 +806,8 @@ router.post('/bulk-import', async (req: Request, res: Response) => {
                   categoryId: categoryId || existing.categoryId,
                   supplierId: supplierId || existing.supplierId,
                   unitId: unitId || existing.unitId,
+                  partOfId: partOfId !== null ? partOfId : existing.partOfId,
+                  subPartOfId: subPartOfId !== null ? subPartOfId : existing.subPartOfId,
                   location: location || existing.location,
                   status: status || existing.status,
                 }
@@ -683,6 +827,8 @@ router.post('/bulk-import', async (req: Request, res: Response) => {
                   categoryId: categoryId || null,
                   supplierId: supplierId || null,
                   unitId: unitId || null,
+                  partOfId: partOfId || null,
+                  subPartOfId: subPartOfId || null,
                   location,
                   status,
                 }
@@ -702,6 +848,8 @@ router.post('/bulk-import', async (req: Request, res: Response) => {
                 categoryId: categoryId || null,
                 supplierId: supplierId || null,
                 unitId: unitId || null,
+                partOfId: partOfId || null,
+                subPartOfId: subPartOfId || null,
                 location,
                 status,
               }
@@ -722,6 +870,8 @@ router.post('/bulk-import', async (req: Request, res: Response) => {
               categoryId: categoryId || null,
               supplierId: supplierId || null,
               unitId: unitId || null,
+              partOfId: partOfId || null,
+              subPartOfId: subPartOfId || null,
               location,
               status,
             }

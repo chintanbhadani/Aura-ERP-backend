@@ -50,6 +50,10 @@ model Product {
   status        Status        @default(Active)
   categoryId    String?
   category      Category?     @relation(fields: [categoryId], references: [id])
+  partOfId      String?
+  partOf        PartOf?       @relation(fields: [partOfId], references: [id])
+  subPartOfId   String?
+  subPartOf     SubPartOf?    @relation(fields: [subPartOfId], references: [id])
   supplierId    String?
   supplier      Supplier?     @relation(fields: [supplierId], references: [id])
   invoiceDate   DateTime?
@@ -232,19 +236,21 @@ model CashLedger {
 }
 
 model PartOf {
-  id        String   @id @default(uuid())
+  id        String    @id @default(uuid())
   name      String
-  disabled  Boolean  @default(false)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  disabled  Boolean   @default(false)
+  products  Product[]
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
 }
 
 model SubPartOf {
-  id        String   @id @default(uuid())
+  id        String    @id @default(uuid())
   name      String
-  disabled  Boolean  @default(false)
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  disabled  Boolean   @default(false)
+  products  Product[]
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
 }
 
 model CashBookConfig {
