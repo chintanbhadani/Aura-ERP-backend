@@ -58,6 +58,329 @@ router.get('/:id', async (req: Request, res: Response) => {
   }
 });
 
+// GET supplier ledger by ID
+router.get('/:id/ledger', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const { startDate, endDate } = req.query;
+
+    const supplier = await prisma.supplier.findUnique({
+      where: { id },
+    });
+
+    if (!supplier) {
+      return res.status(404).json({ error: 'Supplier not found' });
+    }
+
+    // 1. Fetch all PURCHASE invoices for this supplier
+    const invoices = await prisma.invoice.findMany({
+      where: {
+        supplierId: id,
+        type: 'PURCHASE',
+      },
+      include: {
+        items: {
+          include: {
+            product: {
+              select: { id: true, name: true, sku: true }
+            }
+          }
+        },
+        payments: true,
+      },
+      orderBy: { date: 'asc' },
+    });
+
+    // 2. Fetch all payments linked to this supplier
+    const payments = await prisma.payment.findMany({
+      where: { supplierId: id },
+      include: {
+        invoice: {
+          select: { id: true, invoiceNumber: true }
+        }
+      },
+      orderBy: { date: 'asc' },
+    });
+
+    // 3. Build unified transaction list
+    interface LedgerTx {
+      id: string;
+      date: string;
+      rawDate: Date;
+      type: 'INVOICE' | 'PAYMENT';
+      voucherType: string;
+      refNo: string;
+      invoiceId?: string;
+      paymentId?: string;
+      particulars: string;
+      paymentMethod: string;
+      debit: number;
+      credit: number;
+      runningBalance?: number;
+      signedBalance?: number;
+      balanceType?: 'DR' | 'CR' | 'SETTLED';
+      status?: string;
+      details?: any;
+    }
+
+    const txs: LedgerTx[] = [];
+    const paymentIdsProcessed = new Set<string>();
+
+    for (const inv of invoices) {
+      const invTotal = Number(inv.totalAmount || 0);
+      const cashAmt = Number(inv.cashAmount || 0);
+      const bankAmt = Number(inv.bankAmount || 0);
+      const mmAmt = Number(inv.mobileMoneyAmount || 0);
+      const totalPaidAtInv = cashAmt + bankAmt + mmAmt;
+      const creditAmt = Number(inv.creditAmount || (invTotal - totalPaidAtInv));
+
+      // 1) Purchase Invoice Entry (Credit: Increases what we owe the supplier)
+      txs.push({
+        id: `inv-${inv.id}`,
+        date: inv.date.toISOString(),
+        rawDate: new Date(inv.date),
+        type: 'INVOICE',
+        voucherType: 'Purchase Invoice',
+        refNo: inv.invoiceNumber,
+        invoiceId: inv.id,
+        particulars: `Purchase Invoice #${inv.invoiceNumber}${inv.items?.length ? ` (${inv.items.length} item${inv.items.length > 1 ? 's' : ''})` : ''}`,
+        paymentMethod: inv.paymentType,
+        debit: 0,
+        credit: invTotal,
+        status: invTotal <= totalPaidAtInv ? 'PAID' : (totalPaidAtInv > 0 ? 'PARTIAL' : 'CREDIT'),
+        details: {
+          totalAmount: invTotal,
+          cashAmount: cashAmt,
+          bankAmount: bankAmt,
+          creditAmount: creditAmt,
+          mobileMoneyAmount: mmAmt,
+          dueDate: inv.dueDate,
+          notes: inv.notes,
+          paymentTerms: inv.paymentTerms,
+          itemsCount: inv.items.length
+        }
+      });
+
+      // 2) If payments were recorded for this invoice in the Payment table:
+      if (inv.payments && inv.payments.length > 0) {
+        for (const p of inv.payments) {
+          paymentIdsProcessed.add(p.id);
+          const pAmount = Number(p.amount || 0);
+          if (pAmount > 0) {
+            txs.push({
+              id: `pay-${p.id}`,
+              date: p.date.toISOString(),
+              rawDate: new Date(p.date),
+              type: 'PAYMENT',
+              voucherType: 'Bill Payment',
+              refNo: `PMT-${inv.invoiceNumber}`,
+              invoiceId: inv.id,
+              paymentId: p.id,
+              particulars: p.description || `Payment made for ${inv.invoiceNumber} via ${p.paymentType}`,
+              paymentMethod: p.paymentType,
+              debit: p.direction === 'OUT' ? pAmount : 0,
+              credit: p.direction === 'IN' ? pAmount : 0,
+              status: 'SETTLED',
+            });
+          }
+        }
+      } else if (totalPaidAtInv > 0) {
+        // Immediate payment at purchase invoice time without separate Payment row
+        txs.push({
+          id: `inv-pay-${inv.id}`,
+          date: inv.date.toISOString(),
+          rawDate: new Date(inv.date),
+          type: 'PAYMENT',
+          voucherType: 'Immediate Payment',
+          refNo: `PMT-${inv.invoiceNumber}`,
+          invoiceId: inv.id,
+          particulars: `Settled at bill creation via ${inv.paymentType}`,
+          paymentMethod: inv.paymentType,
+          debit: totalPaidAtInv,
+          credit: 0,
+          status: 'SETTLED',
+        });
+      }
+    }
+
+    // 3) Standalone payments (not already processed as part of invoices)
+    for (const p of payments) {
+      if (paymentIdsProcessed.has(p.id)) continue;
+      const pAmount = Number(p.amount || 0);
+      if (pAmount <= 0) continue;
+
+      const isPayment = p.direction === 'OUT';
+      txs.push({
+        id: `pay-${p.id}`,
+        date: p.date.toISOString(),
+        rawDate: new Date(p.date),
+        type: 'PAYMENT',
+        voucherType: isPayment ? 'Payment Made' : 'Supplier Refund',
+        refNo: p.invoice?.invoiceNumber ? `PMT-${p.invoice.invoiceNumber}` : `PAY-${p.id.slice(0, 8).toUpperCase()}`,
+        invoiceId: p.invoiceId || undefined,
+        paymentId: p.id,
+        particulars: p.description || (isPayment ? 'Payment / Advance to supplier' : 'Refund received from supplier'),
+        paymentMethod: p.paymentType,
+        debit: isPayment ? pAmount : 0,
+        credit: isPayment ? 0 : pAmount,
+        status: 'SETTLED',
+      });
+    }
+
+    // Sort chronologically (if same timestamp, INVOICE before PAYMENT)
+    txs.sort((a, b) => {
+      const timeDiff = a.rawDate.getTime() - b.rawDate.getTime();
+      if (timeDiff !== 0) return timeDiff;
+      if (a.type === 'INVOICE' && b.type === 'PAYMENT') return -1;
+      if (a.type === 'PAYMENT' && b.type === 'INVOICE') return 1;
+      return 0;
+    });
+
+    // Compute running balance for Supplier (Liability: Credit - Debit)
+    let runningBalance = 0;
+    let totalCredits = 0;
+    let totalDebits = 0;
+    let totalPurchases = 0;
+    let totalCreditAllowed = 0;
+
+    for (const tx of txs) {
+      totalCredits += tx.credit; // Invoices increase liability
+      totalDebits += tx.debit;   // Payments decrease liability
+      if (tx.type === 'INVOICE') {
+        totalPurchases += tx.credit;
+        if (tx.details?.creditAmount) {
+          totalCreditAllowed += tx.details.creditAmount;
+        }
+      }
+
+      runningBalance = runningBalance + tx.credit - tx.debit;
+      tx.signedBalance = runningBalance;
+      tx.runningBalance = Math.abs(runningBalance);
+      tx.balanceType = runningBalance > 0.001 ? 'CR' : (runningBalance < -0.001 ? 'DR' : 'SETTLED');
+    }
+
+    // Filter by date range if provided
+    let filteredTxs = txs;
+    if (startDate || endDate) {
+      const start = startDate ? new Date(startDate as string) : new Date(0);
+      const end = endDate ? new Date(endDate as string) : new Date(8640000000000000);
+      end.setHours(23, 59, 59, 999);
+      filteredTxs = txs.filter(t => t.rawDate >= start && t.rawDate <= end);
+    }
+
+    const netBalance = runningBalance; // Positive = We owe supplier (Credit Payable), Negative = Advance paid to supplier
+    const outstandingCredit = netBalance > 0.001 ? netBalance : 0;
+    const advanceAmount = netBalance < -0.001 ? Math.abs(netBalance) : 0;
+
+    res.json({
+      party: {
+        id: supplier.id,
+        name: supplier.name,
+        contact: supplier.contact,
+        email: supplier.email,
+        status: supplier.status,
+      },
+      summary: {
+        totalPurchases,
+        totalPaid: totalDebits,
+        totalCreditAllowed,
+        outstandingBalance: outstandingCredit, // Pending / Due to supplier
+        advanceAmount: advanceAmount,         // Advance paid to supplier
+        netBalance,
+        status: outstandingCredit > 0.001 ? 'PAYABLE' : (advanceAmount > 0.001 ? 'ADVANCE' : 'SETTLED'),
+        invoicesCount: invoices.length,
+        paymentsCount: payments.length,
+        transactionsCount: txs.length
+      },
+      transactions: filteredTxs
+    });
+  } catch (error: any) {
+    console.error('Error fetching supplier ledger:', error);
+    res.status(500).json({ error: 'Failed to fetch supplier ledger' });
+  }
+});
+
+// POST record payment to supplier
+router.post('/:id/payments', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const {
+      amount,
+      paymentType,
+      date,
+      description,
+      invoiceId,
+      direction = 'OUT' // Default paying supplier (OUT)
+    } = req.body;
+
+    const numAmount = Number(amount);
+    if (!numAmount || numAmount <= 0) {
+      return res.status(400).json({ error: 'Valid payment amount is required' });
+    }
+
+    const supplier = await prisma.supplier.findUnique({ where: { id } });
+    if (!supplier) {
+      return res.status(404).json({ error: 'Supplier not found' });
+    }
+
+    const pType = paymentType || 'CASH';
+    const paymentDate = date ? new Date(date) : new Date();
+    const amountChange = direction === 'IN' ? numAmount : -numAmount;
+
+    const result = await prisma.$transaction(async (tx) => {
+      // 1. Create Payment record
+      const payment = await tx.payment.create({
+        data: {
+          date: paymentDate,
+          paymentType: pType as any,
+          direction,
+          amount: numAmount,
+          description: description || `Payment made to supplier ${supplier.name}`,
+          supplierId: id,
+          invoiceId: invoiceId || null,
+        }
+      });
+
+      // 2. Update Cash Ledger
+      const currentBalanceResult: any = await tx.$queryRaw`
+        SELECT COALESCE(SUM("amountChange"), 0) AS balance_before
+        FROM "CashLedger"
+        WHERE CAST("paymentType" AS TEXT) = ${pType}
+          AND date < ${paymentDate}::TIMESTAMP
+      `;
+      const balanceBefore = currentBalanceResult[0]?.balance_before ? Number(currentBalanceResult[0].balance_before) : 0;
+      const newRunningBalance = balanceBefore + amountChange;
+
+      await tx.cashLedger.create({
+        data: {
+          date: paymentDate,
+          paymentType: pType as any,
+          sourceType: 'PAYMENT',
+          amountChange: amountChange,
+          runningBalance: newRunningBalance,
+          paymentId: payment.id,
+          invoiceId: invoiceId || null,
+        }
+      });
+
+      // Update future balances
+      await tx.$queryRaw`
+        UPDATE "CashLedger"
+        SET "runningBalance" = "runningBalance" + ${amountChange}
+        WHERE CAST("paymentType" AS TEXT) = ${pType}
+          AND date > ${paymentDate}::TIMESTAMP
+      `;
+
+      return payment;
+    });
+
+    res.status(201).json(result);
+  } catch (error: any) {
+    console.error('Error recording supplier payment:', error);
+    res.status(500).json({ error: error.message || 'Failed to record payment' });
+  }
+});
+
 // POST new supplier
 router.post('/', async (req: Request, res: Response) => {
   try {

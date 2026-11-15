@@ -245,7 +245,7 @@ router.get('/:id', async (req: Request, res: Response) => {
 // POST create new invoice
 router.post('/', async (req: Request, res: Response) => {
   try {
-    const { type, date, dueDate, notes, paymentTerms, customerId, supplierId, items, paymentType, cashAmount, bankAmount, creditAmount, mobileMoneyAmount } = req.body;
+    const { type, date, dueDate, notes, paymentTerms, customerId, supplierId, items, paymentType, cashAmount, bankAmount, creditAmount, mobileMoneyAmount, imageUrl, attachments } = req.body;
 
     if (!type || !items || !items.length) {
       return res.status(400).json({ error: 'Type and items are required' });
@@ -359,6 +359,8 @@ router.post('/', async (req: Request, res: Response) => {
           bankAmount: finalBankAmount,
           creditAmount: finalCreditAmount,
           mobileMoneyAmount: finalMobileMoneyAmount,
+          imageUrl: imageUrl || null,
+          attachments: attachments || null,
           items: {
             create: items.map((item: any) => ({
               productId: item.productId,
@@ -529,6 +531,296 @@ router.post('/', async (req: Request, res: Response) => {
   } catch (error: any) {
     console.error(error);
     res.status(500).json({ error: error.message || 'Failed to create invoice' });
+  }
+});
+
+// PUT update invoice by id
+router.put('/:id', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const {
+      type,
+      date,
+      dueDate,
+      notes,
+      paymentTerms,
+      customerId,
+      supplierId,
+      items,
+      paymentType,
+      cashAmount,
+      bankAmount,
+      creditAmount,
+      mobileMoneyAmount,
+      imageUrl,
+      attachments
+    } = req.body;
+
+    const existingInvoice = await prisma.invoice.findUnique({
+      where: { id },
+      include: {
+        items: true,
+      }
+    });
+
+    if (!existingInvoice) {
+      return res.status(404).json({ error: 'Invoice not found' });
+    }
+
+    if (!type || !items || !items.length) {
+      return res.status(400).json({ error: 'Type and items are required' });
+    }
+
+    const effectiveCustomerId = customerId || req.body.clientId;
+    const effectiveSupplierId = supplierId;
+
+    if (type === 'SALES' && !effectiveCustomerId) {
+      return res.status(400).json({ error: 'Customer is required for sales invoice' });
+    }
+
+    if (type === 'PURCHASE' && !effectiveSupplierId) {
+      return res.status(400).json({ error: 'Supplier is required for purchase invoice' });
+    }
+
+    const totalAmount = items.reduce(
+      (sum: number, item: any) => sum + Number(item.quantity) * Number(item.unitPrice),
+      0
+    );
+
+    const invoiceDate = new Date(date || existingInvoice.date);
+
+    const result = await prisma.$transaction(async (tx) => {
+      // 1. REVERT PREVIOUS STOCK
+      for (const oldItem of existingInvoice.items) {
+        if (!oldItem.productId) continue;
+        const oldQty = Math.round(Number(oldItem.quantity));
+        const revertQty = existingInvoice.type === 'PURCHASE' ? -oldQty : oldQty;
+
+        await tx.product.update({
+          where: { id: oldItem.productId },
+          data: { quantity: { increment: revertQty } }
+        });
+
+        await tx.$queryRaw`
+          UPDATE "StockLedger"
+          SET "runningBalance" = "runningBalance" + ${revertQty}
+          WHERE "productId" = ${oldItem.productId}
+            AND date > ${existingInvoice.date}::TIMESTAMP
+        `;
+      }
+
+      // 2. REVERT PREVIOUS CASH LEDGER
+      const oldCashLedgers = await tx.cashLedger.findMany({ where: { invoiceId: id } });
+      for (const cl of oldCashLedgers) {
+        const revertCash = -Number(cl.amountChange);
+        await tx.$queryRaw`
+          UPDATE "CashLedger"
+          SET "runningBalance" = "runningBalance" + ${revertCash}
+          WHERE "paymentType" = ${cl.paymentType}::"PaymentType"
+            AND date > ${cl.date}::TIMESTAMP
+        `;
+      }
+
+      // Delete old ledger entries & line items for this invoice
+      await tx.stockLedger.deleteMany({ where: { invoiceId: id } });
+      await tx.cashLedger.deleteMany({ where: { invoiceId: id } });
+      await tx.invoiceItem.deleteMany({ where: { invoiceId: id } });
+
+      // 3. CHECK POINT-IN-TIME STOCK IF SALES INVOICE
+      for (const item of items) {
+        if (type === 'SALES') {
+          const currentProduct = await tx.product.findUnique({ where: { id: item.productId } });
+          const totalRequestedQty = items
+            .filter((i: any) => i.productId === item.productId)
+            .reduce((sum: number, i: any) => sum + Number(i.quantity), 0);
+
+          if (!currentProduct || currentProduct.quantity < totalRequestedQty) {
+            throw new Error(`Insufficient stock for product "${currentProduct?.name || item.productId}". Available: ${currentProduct?.quantity || 0}, requested: ${totalRequestedQty}`);
+          }
+        }
+      }
+
+      const finalCashAmount = cashAmount !== undefined ? Number(cashAmount) : (paymentType === 'CASH' ? totalAmount : 0);
+      const finalBankAmount = bankAmount !== undefined ? Number(bankAmount) : (paymentType === 'BANK' ? totalAmount : 0);
+      const finalCreditAmount = creditAmount !== undefined ? Number(creditAmount) : (paymentType === 'CREDIT' ? totalAmount : 0);
+      const finalMobileMoneyAmount = mobileMoneyAmount !== undefined ? Number(mobileMoneyAmount) : (paymentType === 'MOBILE_MONEY' ? totalAmount : 0);
+
+      // 4. UPDATE INVOICE RECORD
+      const updatedInvoice = await tx.invoice.update({
+        where: { id },
+        data: {
+          type,
+          date: invoiceDate,
+          dueDate: dueDate ? new Date(dueDate) : null,
+          notes: notes || null,
+          paymentTerms: paymentTerms || null,
+          totalAmount,
+          customerId: type === 'SALES' ? effectiveCustomerId : null,
+          supplierId: type === 'PURCHASE' ? effectiveSupplierId : null,
+          paymentType: paymentType || 'CASH',
+          cashAmount: finalCashAmount,
+          bankAmount: finalBankAmount,
+          creditAmount: finalCreditAmount,
+          mobileMoneyAmount: finalMobileMoneyAmount,
+          imageUrl: imageUrl !== undefined ? (imageUrl || null) : existingInvoice.imageUrl,
+          attachments: attachments !== undefined ? (attachments || null) : (existingInvoice.attachments as any),
+          items: {
+            create: items.map((item: any) => ({
+              productId: item.productId,
+              quantity: Math.round(Number(item.quantity)),
+              unitPrice: Number(item.unitPrice),
+              totalPrice: Number(item.quantity) * Number(item.unitPrice),
+              costPrice: item.costPrice !== undefined && item.costPrice !== null ? Number(item.costPrice) : null,
+              purchaseInvoiceNo: item.purchaseInvoiceNo || null,
+              purchaseItemId: item.purchaseItemId || null,
+              poAllocations: item.poAllocations || null,
+            })),
+          },
+        },
+        include: {
+          items: true,
+        },
+      });
+
+      // 5. APPLY NEW INVENTORY & STOCK LEDGER
+      for (const item of items) {
+        const product = await tx.product.findUnique({ where: { id: item.productId } });
+        if (!product) throw new Error(`Product with ID ${item.productId} not found`);
+
+        const itemQty = Math.round(Number(item.quantity));
+        const quantityChange = type === 'PURCHASE' ? itemQty : -itemQty;
+
+        const currentBalanceResult: any = await tx.$queryRaw`
+          SELECT COALESCE(SUM("quantityChange"), 0) AS balance_before
+          FROM "StockLedger"
+          WHERE "productId" = ${item.productId}
+            AND date < ${invoiceDate}::TIMESTAMP
+        `;
+        const balanceBefore = currentBalanceResult[0]?.balance_before ? Number(currentBalanceResult[0].balance_before) : 0;
+        const newRunningBalance = balanceBefore + quantityChange;
+
+        await tx.stockLedger.create({
+          data: {
+            productId: item.productId,
+            date: invoiceDate,
+            type: type,
+            quantityChange,
+            runningBalance: newRunningBalance,
+            invoiceId: id,
+          }
+        });
+
+        await tx.$queryRaw`
+          UPDATE "StockLedger"
+          SET "runningBalance" = "runningBalance" + ${quantityChange}
+          WHERE "productId" = ${item.productId}
+            AND date > ${invoiceDate}::TIMESTAMP
+        `;
+
+        await tx.product.update({
+          where: { id: item.productId },
+          data: { quantity: { increment: quantityChange } }
+        });
+      }
+
+      // 6. APPLY NEW CASH LEDGER
+      if (finalCashAmount > 0) {
+        const cashQuantityChange = type === 'SALES' ? finalCashAmount : -finalCashAmount;
+        const currentCashBalanceResult: any = await tx.$queryRaw`
+          SELECT COALESCE(SUM("amountChange"), 0) AS balance_before
+          FROM "CashLedger"
+          WHERE "paymentType" = 'CASH'
+            AND date < ${invoiceDate}::TIMESTAMP
+        `;
+        const cashBalanceBefore = currentCashBalanceResult[0]?.balance_before ? Number(currentCashBalanceResult[0].balance_before) : 0;
+        const newCashRunningBalance = cashBalanceBefore + cashQuantityChange;
+
+        await tx.cashLedger.create({
+          data: {
+            date: invoiceDate,
+            paymentType: 'CASH',
+            sourceType: type === 'SALES' ? 'SALE' : 'PURCHASE',
+            amountChange: cashQuantityChange,
+            runningBalance: newCashRunningBalance,
+            invoiceId: id,
+          }
+        });
+
+        await tx.$queryRaw`
+          UPDATE "CashLedger"
+          SET "runningBalance" = "runningBalance" + ${cashQuantityChange}
+          WHERE "paymentType" = 'CASH'
+            AND date > ${invoiceDate}::TIMESTAMP
+        `;
+      }
+
+      if (finalBankAmount > 0) {
+        const bankQuantityChange = type === 'SALES' ? finalBankAmount : -finalBankAmount;
+        const currentBankBalanceResult: any = await tx.$queryRaw`
+          SELECT COALESCE(SUM("amountChange"), 0) AS balance_before
+          FROM "CashLedger"
+          WHERE "paymentType" = 'BANK'
+            AND date < ${invoiceDate}::TIMESTAMP
+        `;
+        const bankBalanceBefore = currentBankBalanceResult[0]?.balance_before ? Number(currentBankBalanceResult[0].balance_before) : 0;
+        const newBankRunningBalance = bankBalanceBefore + bankQuantityChange;
+
+        await tx.cashLedger.create({
+          data: {
+            date: invoiceDate,
+            paymentType: 'BANK',
+            sourceType: type === 'SALES' ? 'SALE' : 'PURCHASE',
+            amountChange: bankQuantityChange,
+            runningBalance: newBankRunningBalance,
+            invoiceId: id,
+          }
+        });
+
+        await tx.$queryRaw`
+          UPDATE "CashLedger"
+          SET "runningBalance" = "runningBalance" + ${bankQuantityChange}
+          WHERE "paymentType" = 'BANK'
+            AND date > ${invoiceDate}::TIMESTAMP
+        `;
+      }
+
+      if (finalMobileMoneyAmount > 0) {
+        const mmQuantityChange = type === 'SALES' ? finalMobileMoneyAmount : -finalMobileMoneyAmount;
+        const currentMMBalanceResult: any = await tx.$queryRaw`
+          SELECT COALESCE(SUM("amountChange"), 0) AS balance_before
+          FROM "CashLedger"
+          WHERE "paymentType" = 'MOBILE_MONEY'
+            AND date < ${invoiceDate}::TIMESTAMP
+        `;
+        const mmBalanceBefore = currentMMBalanceResult[0]?.balance_before ? Number(currentMMBalanceResult[0].balance_before) : 0;
+        const newMMRunningBalance = mmBalanceBefore + mmQuantityChange;
+
+        await tx.cashLedger.create({
+          data: {
+            date: invoiceDate,
+            paymentType: 'MOBILE_MONEY',
+            sourceType: type === 'SALES' ? 'SALE' : 'PURCHASE',
+            amountChange: mmQuantityChange,
+            runningBalance: newMMRunningBalance,
+            invoiceId: id,
+          }
+        });
+
+        await tx.$queryRaw`
+          UPDATE "CashLedger"
+          SET "runningBalance" = "runningBalance" + ${mmQuantityChange}
+          WHERE "paymentType" = 'MOBILE_MONEY'
+            AND date > ${invoiceDate}::TIMESTAMP
+        `;
+      }
+
+      return updatedInvoice;
+    });
+
+    res.json(result);
+  } catch (error: any) {
+    console.error('Invoice update error:', error);
+    res.status(500).json({ error: error.message || 'Failed to update invoice' });
   }
 });
 

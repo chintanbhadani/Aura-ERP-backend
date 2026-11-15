@@ -304,6 +304,8 @@ router.post('/', async (req: Request, res: Response) => {
           invoiceDate: null,
           location: data.location || '',
           status: data.status || 'Active',
+          imageUrl: data.imageUrl || null,
+          attachments: data.attachments || null,
         },
         include: {
           category: true,
@@ -390,6 +392,8 @@ router.put('/:id', async (req: Request, res: Response) => {
           invoiceDate: data.invoiceDate ? new Date(data.invoiceDate) : undefined,
           location: data.location !== undefined ? data.location : undefined,
           status: data.status !== undefined ? data.status : undefined,
+          imageUrl: data.imageUrl !== undefined ? data.imageUrl : undefined,
+          attachments: data.attachments !== undefined ? data.attachments : undefined,
         },
         include: {
           category: true,

@@ -3,6 +3,7 @@ dotenv.config();
 
 import express from 'express';
 import cors from 'cors';
+import path from 'path';
 import inventoryRoutes from './routes/inventory.routes'; // TS should resolve this to inventory.routes.ts
 
 
@@ -11,6 +12,10 @@ const PORT = process.env.PORT || 8000;
 
 app.use(cors());
 app.use(express.json());
+
+// Serve uploaded files statically
+app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
+app.use('/api/uploads', express.static(path.join(__dirname, '../uploads')));
 
 import authRoutes from './routes/auth.routes';
 import supplierRoutes from './routes/supplier.routes';
@@ -28,6 +33,7 @@ import stockEntryRoutes from './routes/stockEntry.routes';
 import userRoutes from './routes/user.routes';
 import roleRoutes from './routes/role.routes';
 import repackRoutes from './routes/repack.routes';
+import uploadRoutes from './routes/upload.routes';
 
 // Routes setup
 app.get('/health', (req, res) => {
@@ -55,6 +61,7 @@ app.use('/api/reports', reportRoutes);
 app.use('/api/stock-entries', stockEntryRoutes);
 app.use('/api/stock-ledger', stockEntryRoutes); // Alias
 app.use('/api/repack', repackRoutes);
+app.use('/api/upload', uploadRoutes);
 app.use('/api/bin-report', (req, res, next) => {
   req.url = '/bin-report' + req.url;
   inventoryRoutes(req, res, next);

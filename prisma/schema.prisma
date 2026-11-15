@@ -59,6 +59,8 @@ model Product {
   stockLedgers  StockLedger[]
   repackSources RepackEntry[] @relation("RepackSource")
   repackTargets RepackEntry[] @relation("RepackTarget")
+  imageUrl      String?
+  attachments   Json?
   createdAt     DateTime      @default(now())
   updatedAt     DateTime      @updatedAt
 }
@@ -128,6 +130,9 @@ model Invoice {
 
   supplierId String?
   supplier   Supplier? @relation(fields: [supplierId], references: [id])
+
+  imageUrl    String?
+  attachments Json?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt

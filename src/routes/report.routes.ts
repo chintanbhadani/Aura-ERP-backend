@@ -721,4 +721,234 @@ router.get('/sales-summary', async (req: Request, res: Response) => {
   }
 });
 
+// GET party ledger summary report (all customers and suppliers)
+router.get('/party-ledger', async (req: Request, res: Response) => {
+  try {
+    const { type, search } = req.query; // type: 'ALL' | 'CUSTOMER' | 'SUPPLIER'
+
+    // Fetch customers
+    const customers = await prisma.customer.findMany({
+      where: search ? { name: { contains: search as string, mode: 'insensitive' } } : {},
+      include: {
+        invoices: {
+          where: { type: 'SALES' },
+          select: {
+            id: true,
+            invoiceNumber: true,
+            totalAmount: true,
+            cashAmount: true,
+            bankAmount: true,
+            creditAmount: true,
+            mobileMoneyAmount: true,
+            date: true,
+          }
+        },
+        payments: {
+          select: {
+            id: true,
+            amount: true,
+            direction: true,
+            date: true,
+            invoiceId: true,
+          }
+        }
+      },
+      orderBy: { name: 'asc' }
+    });
+
+    // Fetch suppliers
+    const suppliers = await prisma.supplier.findMany({
+      where: search ? { name: { contains: search as string, mode: 'insensitive' } } : {},
+      include: {
+        invoices: {
+          where: { type: 'PURCHASE' },
+          select: {
+            id: true,
+            invoiceNumber: true,
+            totalAmount: true,
+            cashAmount: true,
+            bankAmount: true,
+            creditAmount: true,
+            mobileMoneyAmount: true,
+            date: true,
+          }
+        },
+        payments: {
+          select: {
+            id: true,
+            amount: true,
+            direction: true,
+            date: true,
+            invoiceId: true,
+          }
+        }
+      },
+      orderBy: { name: 'asc' }
+    });
+
+    const rows: any[] = [];
+    let rowIdx = 1;
+
+    // Process customers if requested
+    if (!type || type === 'ALL' || type === 'CUSTOMER') {
+      for (const cust of customers) {
+        let totalSales = 0;
+        let totalCashPaidOnInvoices = 0;
+        let totalCredit = 0;
+        let lastDate: Date | null = null;
+
+        const processedPayIds = new Set<string>();
+
+        for (const inv of cust.invoices) {
+          const invTotal = Number(inv.totalAmount || 0);
+          const cAmt = Number(inv.cashAmount || 0);
+          const bAmt = Number(inv.bankAmount || 0);
+          const mmAmt = Number(inv.mobileMoneyAmount || 0);
+          const paidAtInv = cAmt + bAmt + mmAmt;
+
+          totalSales += invTotal;
+          totalCashPaidOnInvoices += paidAtInv;
+          totalCredit += Number(inv.creditAmount || (invTotal - paidAtInv));
+
+          const invD = new Date(inv.date);
+          if (!lastDate || invD > lastDate) lastDate = invD;
+        }
+
+        let totalStandalonePayments = 0;
+        for (const p of cust.payments) {
+          if (p.invoiceId) continue; // Avoid double count
+          const amt = Number(p.amount || 0);
+          if (p.direction === 'IN') {
+            totalStandalonePayments += amt;
+          } else {
+            totalStandalonePayments -= amt;
+          }
+          const pD = new Date(p.date);
+          if (!lastDate || pD > lastDate) lastDate = pD;
+        }
+
+        const totalCashReceived = totalCashPaidOnInvoices + totalStandalonePayments;
+        const pending = totalSales - totalCashReceived; // Positive = Customer owes us, Negative = Advance from customer
+        const creditDue = pending > 0.001 ? pending : 0;
+        const advanceAmt = pending < -0.001 ? Math.abs(pending) : 0;
+
+        rows.push({
+          no: rowIdx++,
+          partyId: cust.id,
+          partyName: cust.name,
+          partyType: 'CUSTOMER',
+          contact: cust.contact,
+          email: cust.email,
+          creditPurchase: 0,
+          paymentForPurchase: 0,
+          sale: totalSales,
+          credit: totalCredit,
+          cash: totalCashReceived,
+          pending: pending,
+          creditDue: creditDue,
+          advance: advanceAmt,
+          closingMonthEnd: 0,
+          date: lastDate ? toDateStr(lastDate) : '-',
+          invoicesCount: cust.invoices.length,
+          paymentsCount: cust.payments.length
+        });
+      }
+    }
+
+    // Process suppliers if requested
+    if (!type || type === 'ALL' || type === 'SUPPLIER') {
+      for (const supp of suppliers) {
+        let totalPurchases = 0;
+        let totalCashPaidOnInvoices = 0;
+        let totalCredit = 0;
+        let lastDate: Date | null = null;
+
+        for (const inv of supp.invoices) {
+          const invTotal = Number(inv.totalAmount || 0);
+          const cAmt = Number(inv.cashAmount || 0);
+          const bAmt = Number(inv.bankAmount || 0);
+          const mmAmt = Number(inv.mobileMoneyAmount || 0);
+          const paidAtInv = cAmt + bAmt + mmAmt;
+
+          totalPurchases += invTotal;
+          totalCashPaidOnInvoices += paidAtInv;
+          totalCredit += Number(inv.creditAmount || (invTotal - paidAtInv));
+
+          const invD = new Date(inv.date);
+          if (!lastDate || invD > lastDate) lastDate = invD;
+        }
+
+        let totalStandalonePayments = 0;
+        for (const p of supp.payments) {
+          if (p.invoiceId) continue;
+          const amt = Number(p.amount || 0);
+          if (p.direction === 'OUT') {
+            totalStandalonePayments += amt;
+          } else {
+            totalStandalonePayments -= amt;
+          }
+          const pD = new Date(p.date);
+          if (!lastDate || pD > lastDate) lastDate = pD;
+        }
+
+        const totalPaidToSupplier = totalCashPaidOnInvoices + totalStandalonePayments;
+        const pending = totalPurchases - totalPaidToSupplier; // Positive = We owe supplier, Negative = Advance paid
+        const creditPayable = pending > 0.001 ? pending : 0;
+        const advanceAmt = pending < -0.001 ? Math.abs(pending) : 0;
+
+        rows.push({
+          no: rowIdx++,
+          partyId: supp.id,
+          partyName: supp.name,
+          partyType: 'SUPPLIER',
+          contact: supp.contact,
+          email: supp.email,
+          creditPurchase: totalPurchases,
+          paymentForPurchase: totalPaidToSupplier,
+          sale: 0,
+          credit: totalCredit,
+          cash: totalPaidToSupplier,
+          pending: pending,
+          creditDue: creditPayable,
+          advance: advanceAmt,
+          closingMonthEnd: 0,
+          date: lastDate ? toDateStr(lastDate) : '-',
+          invoicesCount: supp.invoices.length,
+          paymentsCount: supp.payments.length
+        });
+      }
+    }
+
+    // Grand totals
+    const grandSummary = rows.reduce((acc, r) => {
+      acc.totalCreditPurchase += r.creditPurchase;
+      acc.totalPaymentForPurchase += r.paymentForPurchase;
+      acc.totalSale += r.sale;
+      acc.totalCredit += r.credit;
+      acc.totalCash += r.cash;
+      acc.netPending += r.pending;
+      acc.totalCreditDue += r.creditDue;
+      acc.totalAdvance += r.advance;
+      return acc;
+    }, {
+      totalCreditPurchase: 0,
+      totalPaymentForPurchase: 0,
+      totalSale: 0,
+      totalCredit: 0,
+      totalCash: 0,
+      netPending: 0,
+      totalCreditDue: 0,
+      totalAdvance: 0,
+    });
+
+    res.json({
+      rows,
+      summary: grandSummary
+    });
+  } catch (error: any) {
+    console.error('Error generating party ledger report:', error);
+    res.status(500).json({ error: error.message || 'Failed to generate party ledger report' });
+  }
+});
+
 export default router;
