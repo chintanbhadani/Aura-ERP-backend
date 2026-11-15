@@ -786,82 +786,55 @@ router.post('/bulk-import', async (req: Request, res: Response) => {
         const location = (row.location || row.binLocation || row['Bin Location'] || '').toString().trim();
         const status = row.status === 'Inactive' || row.disabled === true || row.disabled === 'Yes' ? 'Inactive' : 'Active';
 
-        // Resolve SKU
+        // Resolve SKU and existing product
         let rawSku = (row.sku || row.itemCode || row['Item Code (SKU)'] || '').toString().trim();
         let targetProduct: any = null;
 
+        let existing = null;
         if (rawSku) {
-          const existing = await prisma.product.findUnique({ where: { sku: rawSku } });
-          if (existing) {
-            if (existing.name.trim().toLowerCase() === name.toLowerCase()) {
-              // Same item, update it
-              targetProduct = await prisma.product.update({
-                where: { id: existing.id },
-                data: {
-                  name,
-                  quantity: isNaN(quantity) ? existing.quantity : quantity,
-                  cost_price: isNaN(cost_price) ? existing.cost_price : cost_price,
-                  selling_price: isNaN(selling_price) ? existing.selling_price : selling_price,
-                  min_stock: isNaN(min_stock) ? existing.min_stock : min_stock,
-                  categoryId: categoryId || existing.categoryId,
-                  supplierId: supplierId || existing.supplierId,
-                  unitId: unitId || existing.unitId,
-                  partOfId: partOfId !== null ? partOfId : existing.partOfId,
-                  subPartOfId: subPartOfId !== null ? subPartOfId : existing.subPartOfId,
-                  location: location || existing.location,
-                  status: status || existing.status,
-                }
-              });
-              updatedCount++;
-            } else {
-              // Name differs: collision on demo SKU, auto-increment to unique SKU
-              const uniqueSku = await resolveUniqueSku(rawSku);
-              targetProduct = await prisma.product.create({
-                data: {
-                  sku: uniqueSku,
-                  name,
-                  quantity: isNaN(quantity) ? 0 : quantity,
-                  cost_price: isNaN(cost_price) ? 0 : cost_price,
-                  selling_price: isNaN(selling_price) ? 0 : selling_price,
-                  min_stock: isNaN(min_stock) ? 0 : min_stock,
-                  categoryId: categoryId || null,
-                  supplierId: supplierId || null,
-                  unitId: unitId || null,
-                  partOfId: partOfId || null,
-                  subPartOfId: subPartOfId || null,
-                  location,
-                  status,
-                }
-              });
-              createdCount++;
+          existing = await prisma.product.findUnique({ where: { sku: rawSku } });
+        }
+        if (!existing && name) {
+          existing = await prisma.product.findFirst({
+            where: { name: { equals: name, mode: 'insensitive' } }
+          });
+        }
+
+        if (existing) {
+          // Existing product found: update all attributes including partOfId & subPartOfId
+          targetProduct = await prisma.product.update({
+            where: { id: existing.id },
+            data: {
+              name,
+              quantity: isNaN(quantity) ? existing.quantity : quantity,
+              cost_price: isNaN(cost_price) ? existing.cost_price : cost_price,
+              selling_price: isNaN(selling_price) ? existing.selling_price : selling_price,
+              min_stock: isNaN(min_stock) ? existing.min_stock : min_stock,
+              categoryId: categoryId || existing.categoryId,
+              supplierId: supplierId || existing.supplierId,
+              unitId: unitId || existing.unitId,
+              partOfId: partOfId !== null ? partOfId : existing.partOfId,
+              subPartOfId: subPartOfId !== null ? subPartOfId : existing.subPartOfId,
+              location: location || existing.location,
+              status: status || existing.status,
             }
-          } else {
-            // New SKU
-            targetProduct = await prisma.product.create({
-              data: {
-                sku: rawSku,
-                name,
-                quantity: isNaN(quantity) ? 0 : quantity,
-                cost_price: isNaN(cost_price) ? 0 : cost_price,
-                selling_price: isNaN(selling_price) ? 0 : selling_price,
-                min_stock: isNaN(min_stock) ? 0 : min_stock,
-                categoryId: categoryId || null,
-                supplierId: supplierId || null,
-                unitId: unitId || null,
-                partOfId: partOfId || null,
-                subPartOfId: subPartOfId || null,
-                location,
-                status,
-              }
-            });
-            createdCount++;
-          }
+          });
+          updatedCount++;
         } else {
-          // No SKU provided, generate one
-          const uniqueSku = await resolveUniqueSku(`SKU-${Date.now()}`);
+          // New SKU / product
+          let finalSku = rawSku;
+          if (!finalSku) {
+            finalSku = await resolveUniqueSku(`SKU-${Date.now()}`);
+          } else {
+            const skuCollision = await prisma.product.findUnique({ where: { sku: finalSku } });
+            if (skuCollision) {
+              finalSku = await resolveUniqueSku(finalSku);
+            }
+          }
+
           targetProduct = await prisma.product.create({
             data: {
-              sku: uniqueSku,
+              sku: finalSku,
               name,
               quantity: isNaN(quantity) ? 0 : quantity,
               cost_price: isNaN(cost_price) ? 0 : cost_price,
