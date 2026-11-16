@@ -21,7 +21,10 @@ router.get('/', async (req: Request, res: Response) => {
       },
       orderBy: { name: 'asc' }
     });
-    res.json(customers);
+    res.json(customers.map((c) => ({
+      ...c,
+      disabled: c.status === 'Inactive'
+    })));
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch customers' });
   }
@@ -49,7 +52,10 @@ router.get('/:id', async (req: Request, res: Response) => {
       return res.status(404).json({ error: 'Customer not found' });
     }
 
-    res.json(customer);
+    res.json({
+      ...customer,
+      disabled: customer.status === 'Inactive'
+    });
   } catch (error: any) {
     console.error('Error fetching customer by id:', error);
     res.status(500).json({ error: 'Failed to fetch customer' });
@@ -437,13 +443,26 @@ router.post('/:id/payments', async (req: Request, res: Response) => {
 // POST new customer
 router.post('/', async (req: Request, res: Response) => {
   try {
-    const { name, contact, email } = req.body;
+    const { name, contact, email, status, disabled } = req.body;
     if (!name) return res.status(400).json({ error: 'Name is required' });
 
+    const disabledVal = disabled !== undefined 
+      ? Boolean(disabled) 
+      : (status !== undefined ? (status === 'Inactive' || status === 'Disabled') : false);
+    const statusVal = disabledVal ? 'Inactive' : (status || 'Active');
+
     const customer = await prisma.customer.create({
-      data: { name, contact, email }
+      data: { 
+        name, 
+        contact, 
+        email,
+        status: statusVal
+      }
     });
-    res.status(201).json(customer);
+    res.status(201).json({
+      ...customer,
+      disabled: customer.status === 'Inactive'
+    });
   } catch (error) {
     res.status(500).json({ error: 'Failed to create customer' });
   }
@@ -453,20 +472,34 @@ router.post('/', async (req: Request, res: Response) => {
 router.put('/:id', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-    const { name, contact, email, status } = req.body;
-    if (!name && !status) return res.status(400).json({ error: 'Data is required to update' });
+    const { name, contact, email, status, disabled } = req.body;
+    if (!name && status === undefined && disabled === undefined && contact === undefined && email === undefined) {
+      return res.status(400).json({ error: 'Data is required to update' });
+    }
 
     const updateData: any = {};
     if (name) updateData.name = name;
     if (contact !== undefined) updateData.contact = contact;
     if (email !== undefined) updateData.email = email;
-    if (status) updateData.status = status;
+
+    const disabledVal = disabled !== undefined 
+      ? Boolean(disabled) 
+      : (status !== undefined ? (status === 'Inactive' || status === 'Disabled') : undefined);
+
+    if (disabledVal !== undefined) {
+      updateData.status = disabledVal ? 'Inactive' : 'Active';
+    } else if (status) {
+      updateData.status = status;
+    }
 
     const customer = await prisma.customer.update({
       where: { id },
       data: updateData
     });
-    res.json(customer);
+    res.json({
+      ...customer,
+      disabled: customer.status === 'Inactive'
+    });
   } catch (error) {
     res.status(500).json({ error: 'Failed to update customer' });
   }

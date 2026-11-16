@@ -57,6 +57,7 @@ router.get('/', async (req: Request, res: Response) => {
       subPartOfId: p.subPartOfId,
       subPartOf: p.subPartOf,
       status: p.status,
+      disabled: p.status === 'Inactive',
       location: p.location,
       min_stock: p.min_stock,
       createdAt: p.createdAt,
@@ -119,8 +120,13 @@ router.post('/', async (req: Request, res: Response) => {
 router.put('/:id', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-    const { name, sku, categoryId, status } = req.body;
+    const { name, sku, categoryId, status, disabled } = req.body;
     
+    const disabledVal = disabled !== undefined 
+      ? Boolean(disabled) 
+      : (status !== undefined ? (status === 'Inactive' || status === 'Disabled') : undefined);
+    const statusVal = disabledVal !== undefined ? (disabledVal ? 'Inactive' : 'Active') : status;
+
     const oldSkuMaster = await prisma.skuMaster.findUnique({ where: { id } });
 
     const skuMaster = await prisma.$transaction(async (tx) => {
@@ -128,7 +134,7 @@ router.put('/:id', async (req: Request, res: Response) => {
       if (name) updateData.name = name;
       if (sku) updateData.sku = sku;
       if (categoryId !== undefined) updateData.categoryId = categoryId || null;
-      if (status) updateData.status = status;
+      if (statusVal) updateData.status = statusVal;
 
       const updatedSku = await tx.skuMaster.update({
         where: { id },
@@ -142,7 +148,7 @@ router.put('/:id', async (req: Request, res: Response) => {
         if (name) prodUpdateData.name = name;
         if (sku) prodUpdateData.sku = sku;
         if (categoryId !== undefined) prodUpdateData.categoryId = categoryId || null;
-        if (status) prodUpdateData.status = status;
+        if (statusVal) prodUpdateData.status = statusVal;
 
         await tx.product.updateMany({
           where: { sku: oldSkuMaster.sku },
@@ -153,7 +159,10 @@ router.put('/:id', async (req: Request, res: Response) => {
       return updatedSku;
     });
 
-    res.json(skuMaster);
+    res.json({
+      ...skuMaster,
+      disabled: skuMaster.status === 'Inactive'
+    });
   } catch (error) {
     res.status(500).json({ error: 'Failed to update SKU' });
   }

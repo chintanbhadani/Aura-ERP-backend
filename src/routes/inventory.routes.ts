@@ -58,6 +58,7 @@ async function calculateValuationsForProduct(product: any, ledgers: any[]) {
   
   return {
     ...product,
+    disabled: product.status === 'Inactive',
     wacPrice,
     wacValue: wacQty * wacPrice,
     fifoPrice,
@@ -323,6 +324,11 @@ router.post('/', async (req: Request, res: Response) => {
       }
     }
 
+    const disabledVal = data.disabled !== undefined 
+      ? Boolean(data.disabled) 
+      : (data.status !== undefined ? (data.status === 'Inactive' || data.status === 'Disabled') : false);
+    const statusVal = disabledVal ? 'Inactive' : (data.status || 'Active');
+
     const product = await prisma.$transaction(async (tx) => {
       const created = await tx.product.create({
         data: {
@@ -339,7 +345,7 @@ router.post('/', async (req: Request, res: Response) => {
           subPartOfId: subPartOfId || null,
           invoiceDate: null,
           location: data.location || '',
-          status: data.status || 'Active',
+          status: statusVal,
           imageUrl: data.imageUrl || null,
           attachments: data.attachments || null,
         },
@@ -388,7 +394,10 @@ router.post('/', async (req: Request, res: Response) => {
       return created;
     });
 
-    res.status(201).json(product);
+    res.status(201).json({
+      ...product,
+      disabled: product.status === 'Inactive'
+    });
   } catch (error: any) {
     if (error.code === 'P2002') {
       return res.status(409).json({ error: 'SKU must be unique' });
@@ -460,6 +469,13 @@ router.put('/:id', async (req: Request, res: Response) => {
       }
     }
 
+    const disabledVal = data.disabled !== undefined 
+      ? Boolean(data.disabled) 
+      : (data.status !== undefined ? (data.status === 'Inactive' || data.status === 'Disabled') : undefined);
+    const statusVal = disabledVal !== undefined 
+      ? (disabledVal ? 'Inactive' : 'Active') 
+      : (data.status ? data.status : undefined);
+
     const product = await prisma.$transaction(async (tx) => {
       const updated = await tx.product.update({
         where: { id },
@@ -477,7 +493,7 @@ router.put('/:id', async (req: Request, res: Response) => {
           subPartOfId,
           invoiceDate: data.invoiceDate ? new Date(data.invoiceDate) : undefined,
           location: data.location !== undefined ? data.location : undefined,
-          status: data.status !== undefined ? data.status : undefined,
+          status: statusVal,
           imageUrl: data.imageUrl !== undefined ? data.imageUrl : undefined,
           attachments: data.attachments !== undefined ? data.attachments : undefined,
         },
@@ -514,7 +530,10 @@ router.put('/:id', async (req: Request, res: Response) => {
       return updated;
     });
 
-    res.json(product);
+    res.json({
+      ...product,
+      disabled: product.status === 'Inactive'
+    });
   } catch (error: any) {
     if (error.code === 'P2002') {
       return res.status(409).json({ error: 'SKU must be unique' });

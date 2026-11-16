@@ -21,7 +21,10 @@ router.get('/', async (req: Request, res: Response) => {
       },
       orderBy: { name: 'asc' }
     });
-    res.json(units);
+    res.json(units.map((u) => ({
+      ...u,
+      disabled: u.status === 'Inactive'
+    })));
   } catch (error) {
     res.status(500).json({ error: 'Failed to fetch units' });
   }
@@ -47,7 +50,10 @@ router.get('/:id', async (req: Request, res: Response) => {
       return res.status(404).json({ error: 'Unit not found' });
     }
 
-    res.json(unit);
+    res.json({
+      ...unit,
+      disabled: unit.status === 'Inactive'
+    });
   } catch (error: any) {
     console.error('Error fetching unit by id:', error);
     res.status(500).json({ error: 'Failed to fetch unit' });
@@ -57,13 +63,24 @@ router.get('/:id', async (req: Request, res: Response) => {
 // POST new unit
 router.post('/', async (req: Request, res: Response) => {
   try {
-    const { name } = req.body;
+    const { name, disabled, status } = req.body;
     if (!name) return res.status(400).json({ error: 'Name is required' });
 
+    const disabledVal = disabled !== undefined 
+      ? Boolean(disabled) 
+      : (status !== undefined ? (status === 'Inactive' || status === 'Disabled') : false);
+    const statusVal = disabledVal ? 'Inactive' : (status || 'Active');
+
     const unit = await prisma.unit.create({
-      data: { name }
+      data: { 
+        name,
+        status: statusVal
+      }
     });
-    res.status(201).json(unit);
+    res.status(201).json({
+      ...unit,
+      disabled: unit.status === 'Inactive'
+    });
   } catch (error) {
     res.status(500).json({ error: 'Failed to create unit' });
   }
@@ -73,18 +90,32 @@ router.post('/', async (req: Request, res: Response) => {
 router.put('/:id', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-    const { name, status } = req.body;
-    if (!name && !status) return res.status(400).json({ error: 'Data is required to update' });
+    const { name, status, disabled } = req.body;
+    if (!name && status === undefined && disabled === undefined) {
+      return res.status(400).json({ error: 'Data is required to update' });
+    }
 
     const updateData: any = {};
     if (name) updateData.name = name;
-    if (status) updateData.status = status;
+
+    const disabledVal = disabled !== undefined 
+      ? Boolean(disabled) 
+      : (status !== undefined ? (status === 'Inactive' || status === 'Disabled') : undefined);
+    
+    if (disabledVal !== undefined) {
+      updateData.status = disabledVal ? 'Inactive' : 'Active';
+    } else if (status) {
+      updateData.status = status;
+    }
 
     const unit = await prisma.unit.update({
       where: { id },
       data: updateData
     });
-    res.json(unit);
+    res.json({
+      ...unit,
+      disabled: unit.status === 'Inactive'
+    });
   } catch (error) {
     res.status(500).json({ error: 'Failed to update unit' });
   }
