@@ -8,6 +8,19 @@ const upload = multer({ storage: multer.memoryStorage() });
 const router = Router();
 const prisma = new PrismaClient();
 
+let invoiceColumnsChecked = false;
+async function ensureInvoiceColumns() {
+  if (invoiceColumnsChecked) return;
+  try {
+    await prisma.$executeRawUnsafe(`ALTER TABLE "Invoice" ADD COLUMN IF NOT EXISTS "shippingCharge" DECIMAL(10, 2) DEFAULT 0;`);
+    await prisma.$executeRawUnsafe(`ALTER TABLE "Invoice" ADD COLUMN IF NOT EXISTS "laborCost" DECIMAL(10, 2) DEFAULT 0;`);
+    invoiceColumnsChecked = true;
+  } catch (err) {
+    console.error('Error ensuring Invoice columns:', err);
+  }
+}
+ensureInvoiceColumns();
+
 // Utility to generate invoice number
 const generateInvoiceNumber = async (type: InvoiceType) => {
   const year = new Date().getFullYear();
@@ -245,7 +258,26 @@ router.get('/:id', async (req: Request, res: Response) => {
 // POST create new invoice
 router.post('/', async (req: Request, res: Response) => {
   try {
-    const { type, date, dueDate, notes, paymentTerms, customerId, supplierId, items, paymentType, cashAmount, bankAmount, creditAmount, mobileMoneyAmount, imageUrl, attachments } = req.body;
+    await ensureInvoiceColumns();
+    const { 
+      type, 
+      date, 
+      dueDate, 
+      notes, 
+      paymentTerms, 
+      customerId, 
+      supplierId, 
+      items, 
+      paymentType, 
+      cashAmount, 
+      bankAmount, 
+      creditAmount, 
+      mobileMoneyAmount, 
+      imageUrl, 
+      attachments,
+      shippingCharge,
+      laborCost
+    } = req.body;
 
     if (!type || !items || !items.length) {
       return res.status(400).json({ error: 'Type and items are required' });
@@ -259,10 +291,13 @@ router.post('/', async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'Supplier is required for purchase invoice' });
     }
 
-    const totalAmount = items.reduce(
+    const numShippingCharge = Number(shippingCharge || 0);
+    const numLaborCost = Number(laborCost || 0);
+    const itemsTotal = items.reduce(
       (sum: number, item: any) => sum + Number(item.quantity) * Number(item.unitPrice),
       0
     );
+    const totalAmount = itemsTotal + numShippingCharge + numLaborCost;
 
     const invoiceNumber = await generateInvoiceNumber(type as InvoiceType);
 
@@ -352,6 +387,8 @@ router.post('/', async (req: Request, res: Response) => {
           notes: notes || null,
           paymentTerms: paymentTerms || null,
           totalAmount,
+          shippingCharge: numShippingCharge,
+          laborCost: numLaborCost,
           customerId: type === 'SALES' ? customerId : null,
           supplierId: type === 'PURCHASE' ? supplierId : null,
           paymentType: paymentType || 'CASH',
@@ -537,6 +574,7 @@ router.post('/', async (req: Request, res: Response) => {
 // PUT update invoice by id
 router.put('/:id', async (req: Request, res: Response) => {
   try {
+    await ensureInvoiceColumns();
     const { id } = req.params;
     const {
       type,
@@ -553,7 +591,9 @@ router.put('/:id', async (req: Request, res: Response) => {
       creditAmount,
       mobileMoneyAmount,
       imageUrl,
-      attachments
+      attachments,
+      shippingCharge,
+      laborCost
     } = req.body;
 
     const existingInvoice = await prisma.invoice.findUnique({
@@ -582,10 +622,17 @@ router.put('/:id', async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'Supplier is required for purchase invoice' });
     }
 
-    const totalAmount = items.reduce(
+    const numShippingCharge = shippingCharge !== undefined
+      ? Number(shippingCharge || 0)
+      : Number((existingInvoice as any).shippingCharge || 0);
+    const numLaborCost = laborCost !== undefined
+      ? Number(laborCost || 0)
+      : Number((existingInvoice as any).laborCost || 0);
+    const itemsTotal = items.reduce(
       (sum: number, item: any) => sum + Number(item.quantity) * Number(item.unitPrice),
       0
     );
+    const totalAmount = itemsTotal + numShippingCharge + numLaborCost;
 
     const invoiceDate = new Date(date || existingInvoice.date);
 
@@ -655,6 +702,8 @@ router.put('/:id', async (req: Request, res: Response) => {
           notes: notes || null,
           paymentTerms: paymentTerms || null,
           totalAmount,
+          shippingCharge: numShippingCharge,
+          laborCost: numLaborCost,
           customerId: type === 'SALES' ? effectiveCustomerId : null,
           supplierId: type === 'PURCHASE' ? effectiveSupplierId : null,
           paymentType: paymentType || 'CASH',
