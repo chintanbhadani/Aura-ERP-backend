@@ -80,6 +80,9 @@ async function main() {
           "Invoice",
           "Expense",
           "ExpenseMaster",
+          "RepackEntry",
+          "StockCountItem",
+          "StockCountSession",
           "Product",
           "SkuMaster",
           "SubPartOf",
@@ -91,7 +94,7 @@ async function main() {
           "CashBookConfig"
         CASCADE;
       `);
-      console.log('✅ Cleared: Invoices, Ledgers, Payments, Expenses, Products, Customers, Suppliers, Categories, Units, SKUs.');
+      console.log('✅ Cleared: Invoices, Ledgers, Payments, Expenses, Repacks, Stock Counts, Products, Customers, Suppliers, Categories, Units, SKUs.');
       console.log('ℹ️  Kept: Users & Roles');
     } else {
       // Clear only transactional data
@@ -102,10 +105,13 @@ async function main() {
           "CashLedger",
           "Payment",
           "Invoice",
-          "Expense"
+          "Expense",
+          "RepackEntry",
+          "StockCountItem",
+          "StockCountSession"
         CASCADE;
       `);
-      console.log('✅ Cleared: Invoices, InvoiceItems, StockLedgers, CashLedgers, Payments, Expenses.');
+      console.log('✅ Cleared: Invoices, InvoiceItems, StockLedgers, CashLedgers, Payments, Expenses, RepackEntries, StockCountSessions.');
 
       // Reset product stock counts to 0
       const updateResult = await prisma.product.updateMany({
