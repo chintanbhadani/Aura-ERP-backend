@@ -34,6 +34,7 @@ import userRoutes from './routes/user.routes';
 import roleRoutes from './routes/role.routes';
 import repackRoutes from './routes/repack.routes';
 import uploadRoutes from './routes/upload.routes';
+import stockCountRoutes from './routes/stockCount.routes';
 
 // Routes setup
 app.get('/health', (req, res) => {
@@ -61,6 +62,7 @@ app.use('/api/reports', reportRoutes);
 app.use('/api/stock-entries', stockEntryRoutes);
 app.use('/api/stock-ledger', stockEntryRoutes); // Alias
 app.use('/api/repack', repackRoutes);
+app.use('/api/stock-count', stockCountRoutes);
 app.use('/api/upload', uploadRoutes);
 app.use('/api/bin-report', (req, res, next) => {
   req.url = '/bin-report' + req.url;

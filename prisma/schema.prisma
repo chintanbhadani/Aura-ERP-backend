@@ -117,6 +117,8 @@ model Invoice {
   type              InvoiceType
   date              DateTime      @default(now())
   totalAmount       Decimal       @db.Decimal(10, 2)
+  shippingCharge    Decimal?      @default(0) @db.Decimal(10, 2)
+  laborCost         Decimal?      @default(0) @db.Decimal(10, 2)
   paymentType       PaymentType   @default(CASH)
   cashAmount        Decimal       @default(0) @db.Decimal(10, 2)
   bankAmount        Decimal       @default(0) @db.Decimal(10, 2)
@@ -287,4 +289,45 @@ model RepackEntry {
   
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
+}
+
+model StockCountSession {
+  id               String           @id @default(uuid())
+  sessionNumber    String           @unique
+  periodType       String           @default("WEEKLY") // WEEKLY, BIWEEKLY, MONTHLY, ADHOC
+  countDate        DateTime         @default(now())
+  title            String
+  status           String           @default("Draft") // Draft, In Progress, Reconciled
+  totalItems       Int              @default(0)
+  matchedItems     Int              @default(0)
+  discrepantItems  Int              @default(0)
+  netVarianceQty   Int              @default(0)
+  netVarianceValue Decimal          @default(0) @db.Decimal(12, 2)
+  notes            String?
+  reconciledAt     DateTime?
+  reconciledBy     String?
+  items            StockCountItem[]
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+}
+
+model StockCountItem {
+  id            String            @id @default(uuid())
+  sessionId     String
+  session       StockCountSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  productId     String
+  itemCode      String
+  itemName      String
+  itemGroup     String?
+  uom           String?
+  location      String?
+  costPrice     Decimal           @default(0) @db.Decimal(10, 2)
+  systemQty     Int               @default(0)
+  countedQty    Int?
+  varianceQty   Int               @default(0)
+  varianceValue Decimal           @default(0) @db.Decimal(12, 2)
+  status        String            @default("Pending") // Matched, Shortage, Surplus, Pending
+  reason        String?
+  createdAt     DateTime          @default(now())
+  updatedAt     DateTime          @updatedAt
 }

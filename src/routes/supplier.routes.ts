@@ -134,6 +134,15 @@ router.get('/:id/ledger', async (req: Request, res: Response) => {
       const totalPaidAtInv = cashAmt + bankAmt + mmAmt;
       const creditAmt = Number(inv.creditAmount || (invTotal - totalPaidAtInv));
 
+      // Calculate payments recorded for this invoice in Payment table
+      const totalPaymentsForInv = (inv.payments || []).reduce(
+        (acc: number, p: any) => acc + (p.direction === 'OUT' ? Number(p.amount || 0) : -Number(p.amount || 0)),
+        0
+      );
+      const totalPaidSoFar = totalPaidAtInv + totalPaymentsForInv;
+      const dueAmount = Math.max(0, invTotal - totalPaidSoFar);
+      const invoiceStatus = dueAmount <= 0.001 ? 'PAID' : (totalPaidSoFar > 0 ? 'PARTIAL' : 'CREDIT');
+
       // 1) Purchase Invoice Entry (Credit: Increases what we owe the supplier)
       txs.push({
         id: `inv-${inv.id}`,
@@ -147,7 +156,7 @@ router.get('/:id/ledger', async (req: Request, res: Response) => {
         paymentMethod: inv.paymentType,
         debit: 0,
         credit: invTotal,
-        status: invTotal <= totalPaidAtInv ? 'PAID' : (totalPaidAtInv > 0 ? 'PARTIAL' : 'CREDIT'),
+        status: invoiceStatus,
         details: {
           totalAmount: invTotal,
           cashAmount: cashAmt,
@@ -157,7 +166,9 @@ router.get('/:id/ledger', async (req: Request, res: Response) => {
           dueDate: inv.dueDate,
           notes: inv.notes,
           paymentTerms: inv.paymentTerms,
-          itemsCount: inv.items.length
+          itemsCount: inv.items.length,
+          paidAmount: totalPaidSoFar,
+          dueAmount: dueAmount,
         }
       });
 
@@ -310,7 +321,8 @@ router.post('/:id/payments', async (req: Request, res: Response) => {
       date,
       description,
       invoiceId,
-      direction = 'OUT' // Default paying supplier (OUT)
+      direction = 'OUT', // Default paying supplier (OUT)
+      allocations
     } = req.body;
 
     const numAmount = Number(amount);
@@ -328,18 +340,61 @@ router.post('/:id/payments', async (req: Request, res: Response) => {
     const amountChange = direction === 'IN' ? numAmount : -numAmount;
 
     const result = await prisma.$transaction(async (tx) => {
-      // 1. Create Payment record
-      const payment = await tx.payment.create({
-        data: {
-          date: paymentDate,
-          paymentType: pType as any,
-          direction,
-          amount: numAmount,
-          description: description || `Payment made to supplier ${supplier.name}`,
-          supplierId: id,
-          invoiceId: invoiceId || null,
+      const createdPayments: any[] = [];
+      let totalAllocated = 0;
+
+      // 1. If multi-invoice allocations are provided
+      if (Array.isArray(allocations) && allocations.length > 0) {
+        for (const alloc of allocations) {
+          const allocAmt = Number(alloc.amount);
+          if (allocAmt > 0) {
+            totalAllocated += allocAmt;
+            const p = await tx.payment.create({
+              data: {
+                date: paymentDate,
+                paymentType: pType as any,
+                direction,
+                amount: allocAmt,
+                description: alloc.description || description || `Payment made for ${alloc.refNo || 'invoice'}`,
+                supplierId: id,
+                invoiceId: alloc.invoiceId || null,
+              }
+            });
+            createdPayments.push(p);
+          }
         }
-      });
+
+        // Remaining unallocated advance amount
+        const unallocatedAdvance = numAmount - totalAllocated;
+        if (unallocatedAdvance > 0.001) {
+          const advP = await tx.payment.create({
+            data: {
+              date: paymentDate,
+              paymentType: pType as any,
+              direction,
+              amount: unallocatedAdvance,
+              description: description ? `${description} (Advance on Account)` : `Advance payment to supplier ${supplier.name}`,
+              supplierId: id,
+              invoiceId: null,
+            }
+          });
+          createdPayments.push(advP);
+        }
+      } else {
+        // Standard single payment / general payment
+        const payment = await tx.payment.create({
+          data: {
+            date: paymentDate,
+            paymentType: pType as any,
+            direction,
+            amount: numAmount,
+            description: description || `Payment made to supplier ${supplier.name}`,
+            supplierId: id,
+            invoiceId: invoiceId || null,
+          }
+        });
+        createdPayments.push(payment);
+      }
 
       // 2. Update Cash Ledger
       const currentBalanceResult: any = await tx.$queryRaw`
@@ -358,7 +413,7 @@ router.post('/:id/payments', async (req: Request, res: Response) => {
           sourceType: 'PAYMENT',
           amountChange: amountChange,
           runningBalance: newRunningBalance,
-          paymentId: payment.id,
+          paymentId: createdPayments[0]?.id || null,
           invoiceId: invoiceId || null,
         }
       });
@@ -371,7 +426,7 @@ router.post('/:id/payments', async (req: Request, res: Response) => {
           AND date > ${paymentDate}::TIMESTAMP
       `;
 
-      return payment;
+      return createdPayments.length === 1 ? createdPayments[0] : { success: true, count: createdPayments.length, payments: createdPayments };
     });
 
     res.status(201).json(result);
