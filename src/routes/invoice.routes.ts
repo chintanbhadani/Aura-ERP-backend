@@ -14,6 +14,8 @@ async function ensureInvoiceColumns() {
   try {
     await prisma.$executeRawUnsafe(`ALTER TABLE "Invoice" ADD COLUMN IF NOT EXISTS "shippingCharge" DECIMAL(10, 2) DEFAULT 0;`);
     await prisma.$executeRawUnsafe(`ALTER TABLE "Invoice" ADD COLUMN IF NOT EXISTS "laborCost" DECIMAL(10, 2) DEFAULT 0;`);
+    await prisma.$executeRawUnsafe(`ALTER TABLE "Invoice" ADD COLUMN IF NOT EXISTS "status" TEXT DEFAULT 'Draft';`);
+    await prisma.$executeRawUnsafe(`UPDATE "Invoice" SET "status" = 'Draft' WHERE "status" IS NULL;`);
     invoiceColumnsChecked = true;
   } catch (err) {
     console.error('Error ensuring Invoice columns:', err);
@@ -75,6 +77,7 @@ router.get('/', async (req: Request, res: Response) => {
     });
     const formatted = invoices.map((inv) => ({
       ...inv,
+      status: inv.status || 'Draft',
       client: inv.customer ? { ...inv.customer, companyName: inv.customer.name } : null,
     }));
     res.json(formatted);
@@ -247,6 +250,7 @@ router.get('/:id', async (req: Request, res: Response) => {
     if (!invoice) return res.status(404).json({ error: 'Invoice not found' });
     const formatted = {
       ...invoice,
+      status: invoice.status || 'Draft',
       client: invoice.customer ? { ...invoice.customer, companyName: invoice.customer.name } : null,
     };
     res.json(formatted);
@@ -276,7 +280,8 @@ router.post('/', async (req: Request, res: Response) => {
       imageUrl, 
       attachments,
       shippingCharge,
-      laborCost
+      laborCost,
+      status
     } = req.body;
 
     if (!type || !items || !items.length) {
@@ -398,6 +403,7 @@ router.post('/', async (req: Request, res: Response) => {
           mobileMoneyAmount: finalMobileMoneyAmount,
           imageUrl: imageUrl || null,
           attachments: attachments || null,
+          status: status || 'Draft',
           items: {
             create: items.map((item: any) => ({
               productId: item.productId,
@@ -593,7 +599,8 @@ router.put('/:id', async (req: Request, res: Response) => {
       imageUrl,
       attachments,
       shippingCharge,
-      laborCost
+      laborCost,
+      status
     } = req.body;
 
     const existingInvoice = await prisma.invoice.findUnique({
@@ -713,6 +720,7 @@ router.put('/:id', async (req: Request, res: Response) => {
           mobileMoneyAmount: finalMobileMoneyAmount,
           imageUrl: imageUrl !== undefined ? (imageUrl || null) : existingInvoice.imageUrl,
           attachments: attachments !== undefined ? (attachments || null) : (existingInvoice.attachments as any),
+          status: status !== undefined ? status : ((existingInvoice as any).status || 'Draft'),
           items: {
             create: items.map((item: any) => ({
               productId: item.productId,

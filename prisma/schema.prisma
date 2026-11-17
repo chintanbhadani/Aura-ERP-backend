@@ -127,6 +127,7 @@ model Invoice {
   dueDate           DateTime?
   notes             String?
   paymentTerms      String?
+  status            String?       @default("Draft")
   items             InvoiceItem[]
   stockLedgers      StockLedger[]
   payments          Payment[]
