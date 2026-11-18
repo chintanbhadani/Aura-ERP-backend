@@ -116,6 +116,76 @@ router.get('/', async (req: Request, res: Response) => {
   }
 });
 
+// GET Point-in-time stock for all products as of a specific date (Strict Audit)
+router.get('/stock-as-of-date', async (req: Request, res: Response) => {
+  try {
+    const { date } = req.query;
+    if (!date) {
+      return res.status(400).json({ error: 'Date parameter is required' });
+    }
+    const targetDate = new Date(String(date));
+    if (isNaN(targetDate.getTime())) {
+      return res.status(400).json({ error: 'Invalid date format' });
+    }
+
+    // Set target date to end of that day (23:59:59.999) to cover all transactions on that date
+    const endOfDay = new Date(targetDate);
+    endOfDay.setHours(23, 59, 59, 999);
+
+    const stockRows: any = await prisma.$queryRaw`
+      SELECT 
+        p.id,
+        p.name,
+        p.sku,
+        p.quantity AS "currentStock",
+        p."createdAt" AS "productCreatedAt",
+        COALESCE(SUM(sl."quantityChange"), 0)::INTEGER AS "ledgerSumAtDate",
+        COALESCE(all_sl."totalLedgerSum", 0)::INTEGER AS "totalLedgerSum",
+        MIN(CASE WHEN sl."quantityChange" > 0 THEN sl.date END) AS "firstStockDate"
+      FROM "Product" p
+      LEFT JOIN "StockLedger" sl 
+        ON sl."productId" = p.id 
+        AND sl.date <= ${endOfDay}::TIMESTAMP
+      LEFT JOIN (
+        SELECT "productId", SUM("quantityChange") AS "totalLedgerSum"
+        FROM "StockLedger"
+        GROUP BY "productId"
+      ) all_sl ON all_sl."productId" = p.id
+      GROUP BY p.id, p.name, p.sku, p.quantity, p."createdAt", all_sl."totalLedgerSum"
+    `;
+
+    const resultMap: Record<string, { stockAsOfDate: number; currentStock: number; firstStockDate: string | null; name: string; sku: string }> = {};
+    for (const row of stockRows) {
+      const currentStock = Number(row.currentStock) || 0;
+      const ledgerSumAtDate = Number(row.ledgerSumAtDate) || 0;
+      const totalLedgerSum = Number(row.totalLedgerSum) || 0;
+      const unrecordedInitial = Math.max(0, currentStock - totalLedgerSum);
+
+      const isInitialBeforeTarget = row.productCreatedAt && new Date(row.productCreatedAt) <= endOfDay;
+      const initialStockCredit = isInitialBeforeTarget ? unrecordedInitial : 0;
+      const stockAsOfDate = ledgerSumAtDate + initialStockCredit;
+
+      let firstDate = row.firstStockDate ? new Date(row.firstStockDate) : null;
+      if (!firstDate && unrecordedInitial > 0 && row.productCreatedAt) {
+        firstDate = new Date(row.productCreatedAt);
+      }
+
+      resultMap[row.id] = {
+        stockAsOfDate: Math.max(0, stockAsOfDate),
+        currentStock,
+        firstStockDate: firstDate ? firstDate.toISOString() : null,
+        name: row.name,
+        sku: row.sku || ''
+      };
+    }
+
+    res.json(resultMap);
+  } catch (error: any) {
+    console.error('Error fetching point-in-time stock:', error);
+    res.status(500).json({ error: error.message || 'Failed to fetch point-in-time stock' });
+  }
+});
+
 // GET Bin Report (Stock Balance)
 router.get('/bin-report', async (req: Request, res: Response) => {
   try {

@@ -307,72 +307,139 @@ router.post('/', async (req: Request, res: Response) => {
     const invoiceNumber = await generateInvoiceNumber(type as InvoiceType);
 
     const invoiceDate = new Date(date || Date.now());
+    const isDraft = !status || String(status).trim().toLowerCase() === 'draft';
 
     // Use a transaction to ensure all operations succeed or fail together
     const result = await prisma.$transaction(async (tx) => {
-      // 1. Verify chronological stock (The "Future-Dip" check)
-      for (const item of items) {
-        const quantityChange = type === 'PURCHASE' ? Number(item.quantity) : -Number(item.quantity);
-        
-        // Ensure opening/initial stock is recorded in StockLedger if product has positive quantity but missing ledger entries
-        const currentProduct = await tx.product.findUnique({ where: { id: item.productId } });
-        if (currentProduct && currentProduct.quantity > 0) {
-          const ledgerAgg = await tx.stockLedger.aggregate({
-            where: { productId: item.productId },
-            _sum: { quantityChange: true },
-          });
-          const ledgerSum = ledgerAgg._sum.quantityChange || 0;
-          const diff = currentProduct.quantity - ledgerSum;
-          if (diff > 0) {
-            const initialDate = currentProduct.createdAt || new Date('2020-01-01');
-            await tx.stockLedger.create({
-              data: {
-                productId: item.productId,
-                date: initialDate,
-                type: 'INITIAL',
-                quantityChange: diff,
-                runningBalance: diff,
-                createdAt: initialDate,
-              },
+      // 1. Verify chronological stock (The "Future-Dip" check) ONLY if submitting (not draft)
+      if (!isDraft) {
+        for (const item of items) {
+          const quantityChange = type === 'PURCHASE' ? Number(item.quantity) : -Number(item.quantity);
+          
+          // Ensure opening/initial stock is recorded in StockLedger if product has positive quantity but missing ledger entries
+          const currentProduct = await tx.product.findUnique({ where: { id: item.productId } });
+          if (currentProduct && currentProduct.quantity > 0) {
+            const ledgerAgg = await tx.stockLedger.aggregate({
+              where: { productId: item.productId },
+              _sum: { quantityChange: true },
             });
-            await tx.$executeRaw`
-              UPDATE "StockLedger"
-              SET "runningBalance" = "runningBalance" + ${diff}
-              WHERE "productId" = ${item.productId}
-                AND date > ${initialDate}::TIMESTAMP
-            `;
+            const ledgerSum = ledgerAgg._sum.quantityChange || 0;
+            const diff = currentProduct.quantity - ledgerSum;
+            if (diff > 0) {
+              const initialDate = currentProduct.createdAt || new Date('2020-01-01');
+              await tx.stockLedger.create({
+                data: {
+                  productId: item.productId,
+                  date: initialDate,
+                  type: 'INITIAL',
+                  quantityChange: diff,
+                  runningBalance: diff,
+                  createdAt: initialDate,
+                },
+              });
+              await tx.$executeRaw`
+                UPDATE "StockLedger"
+                SET "runningBalance" = "runningBalance" + ${diff}
+                WHERE "productId" = ${item.productId}
+                  AND date > ${initialDate}::TIMESTAMP
+              `;
+            }
           }
-        }
 
-        if (type === 'SALES') {
-          // Check stock point-in-time and future
-          const minBalanceResult: any = await tx.$queryRaw`
-            WITH proposed_ledger AS (
-                SELECT date, "quantityChange"
+          if (type === 'SALES') {
+            const totalRequestedQty = items
+              .filter((i: any) => i.productId === item.productId)
+              .reduce((sum: number, i: any) => sum + Number(i.quantity), 0);
+
+            if (!currentProduct || currentProduct.quantity < totalRequestedQty) {
+              throw new Error(`Insufficient current stock for "${currentProduct?.name || item.productId}". Available today: ${currentProduct?.quantity || 0}, requested: ${totalRequestedQty}`);
+            }
+
+            // 1. Strict Point-in-Time Check: Verify stock was actually available on the invoice date
+            const balanceAtDateResult: any = await tx.$queryRaw`
+              SELECT COALESCE(SUM("quantityChange"), 0) AS balance_at_date
+              FROM "StockLedger"
+              WHERE "productId" = ${item.productId}
+                AND date <= ${invoiceDate}::TIMESTAMP
+            `;
+            const balanceAtDate = balanceAtDateResult[0]?.balance_at_date !== undefined
+              ? Number(balanceAtDateResult[0].balance_at_date)
+              : 0;
+
+            if (balanceAtDate < totalRequestedQty) {
+              const firstArrivalResult: any = await tx.$queryRaw`
+                SELECT MIN(date) AS first_date
                 FROM "StockLedger"
                 WHERE "productId" = ${item.productId}
-                
-                UNION ALL
-                
-                SELECT ${invoiceDate}::TIMESTAMP, ${quantityChange}::INTEGER
-            ),
-            cumulative_calculation AS (
-                SELECT 
-                    date,
-                    SUM("quantityChange") OVER (ORDER BY date ASC) AS cumulative_balance
-                FROM proposed_ledger
-            )
-            SELECT MIN(cumulative_balance) AS min_future_balance
-            FROM cumulative_calculation
-            WHERE date >= ${invoiceDate}::TIMESTAMP;
-          `;
-          
-          const rawMin = minBalanceResult[0]?.min_future_balance;
-          const minFutureBalance =
-            rawMin !== undefined && rawMin !== null ? Number(rawMin) : quantityChange;
-          
-          if (minFutureBalance < 0) {
-            throw new Error(`Insufficient stock for product. Backdating this sale causes inventory to drop below zero (Dip: ${minFutureBalance}) on or after ${invoiceDate.toISOString()}.`);
+                  AND "quantityChange" > 0
+              `;
+              const firstDateStr = firstArrivalResult[0]?.first_date
+                ? new Date(firstArrivalResult[0].first_date).toLocaleDateString('en-GB')
+                : (currentProduct.createdAt ? new Date(currentProduct.createdAt).toLocaleDateString('en-GB') : 'a later date');
+              const invDateStr = invoiceDate.toLocaleDateString('en-GB');
+
+              throw new Error(
+                `Strict Audit Check Failed: Item "${currentProduct.name}" had only ${balanceAtDate} in stock on ${invDateStr} (requested: ${totalRequestedQty}). Stock first became available on ${firstDateStr}. To sell this item, change the invoice date to ${firstDateStr} or later, or backdate the purchase receipt.`
+              );
+            }
+
+            // 2. Strict Chronological Future-Dip Check
+            const minBalanceResult: any = await tx.$queryRaw`
+              WITH proposed_ledger AS (
+                  SELECT date, "quantityChange"
+                  FROM "StockLedger"
+                  WHERE "productId" = ${item.productId}
+                  
+                  UNION ALL
+                  
+                  SELECT ${invoiceDate}::TIMESTAMP, ${quantityChange}::INTEGER
+              ),
+              cumulative_calculation AS (
+                  SELECT 
+                      date,
+                      SUM("quantityChange") OVER (ORDER BY date ASC) AS cumulative_balance
+                  FROM proposed_ledger
+              )
+              SELECT MIN(cumulative_balance) AS min_future_balance
+              FROM cumulative_calculation
+              WHERE date >= ${invoiceDate}::TIMESTAMP;
+            `;
+            
+            const rawMin = minBalanceResult[0]?.min_future_balance;
+            const minFutureBalance =
+              rawMin !== undefined && rawMin !== null ? Number(rawMin) : quantityChange;
+            
+            if (minFutureBalance < 0) {
+              const dipRowResult: any = await tx.$queryRaw`
+                WITH proposed_ledger AS (
+                    SELECT date, "quantityChange"
+                    FROM "StockLedger"
+                    WHERE "productId" = ${item.productId}
+                    
+                    UNION ALL
+                    
+                    SELECT ${invoiceDate}::TIMESTAMP, ${quantityChange}::INTEGER
+                ),
+                cumulative_calculation AS (
+                    SELECT 
+                        date,
+                        SUM("quantityChange") OVER (ORDER BY date ASC) AS cumulative_balance
+                    FROM proposed_ledger
+                )
+                SELECT date, cumulative_balance
+                FROM cumulative_calculation
+                WHERE date >= ${invoiceDate}::TIMESTAMP AND cumulative_balance < 0
+                ORDER BY date ASC
+                LIMIT 1;
+              `;
+              const dipDateStr = dipRowResult[0]?.date
+                ? new Date(dipRowResult[0].date).toLocaleDateString('en-GB')
+                : invoiceDate.toLocaleDateString('en-GB');
+
+              throw new Error(
+                `Strict Audit Check Failed: Selling on ${invoiceDate.toLocaleDateString('en-GB')} causes inventory for "${currentProduct.name}" to drop below zero (deficit of ${Math.abs(minFutureBalance)}) on subsequent date ${dipDateStr}.`
+              );
+            }
           }
         }
       }
@@ -403,7 +470,7 @@ router.post('/', async (req: Request, res: Response) => {
           mobileMoneyAmount: finalMobileMoneyAmount,
           imageUrl: imageUrl || null,
           attachments: attachments || null,
-          status: status || 'Draft',
+          status: isDraft ? 'Draft' : (status || 'Submitted'),
           items: {
             create: items.map((item: any) => ({
               productId: item.productId,
@@ -422,149 +489,151 @@ router.post('/', async (req: Request, res: Response) => {
         },
       });
 
-      // 3. Update Inventory and Ledger
-      for (const item of items) {
-        const product = await tx.product.findUnique({
-          where: { id: item.productId },
-        });
+      // 3. Update Inventory and Ledger ONLY if submitting (not draft)
+      if (!isDraft) {
+        for (const item of items) {
+          const product = await tx.product.findUnique({
+            where: { id: item.productId },
+          });
 
-        if (!product) {
-          throw new Error(`Product with ID ${item.productId} not found`);
+          if (!product) {
+            throw new Error(`Product with ID ${item.productId} not found`);
+          }
+
+          const quantityChange = type === 'PURCHASE' ? Number(item.quantity) : -Number(item.quantity);
+          
+          // Calculate the specific running balance for THIS new row based on past ledger entries
+          const currentBalanceResult: any = await tx.$queryRaw`
+            SELECT COALESCE(SUM("quantityChange"), 0) AS balance_before
+            FROM "StockLedger"
+            WHERE "productId" = ${item.productId}
+              AND date < ${invoiceDate}::TIMESTAMP
+          `;
+          
+          const balanceBefore = currentBalanceResult[0]?.balance_before ? Number(currentBalanceResult[0].balance_before) : 0;
+          const newRunningBalance = balanceBefore + quantityChange;
+
+          // Insert into ledger
+          await tx.stockLedger.create({
+            data: {
+              productId: item.productId,
+              date: invoiceDate,
+              type: type,
+              quantityChange: quantityChange,
+              runningBalance: newRunningBalance,
+              invoiceId: invoice.id,
+            }
+          });
+
+          // Forward Recalculation for future ledger entries if this was backdated
+          await tx.$queryRaw`
+              UPDATE "StockLedger"
+              SET "runningBalance" = "runningBalance" + ${quantityChange}
+              WHERE "productId" = ${item.productId}
+                AND date > ${invoiceDate}::TIMESTAMP
+          `;
+
+          // Update the cached quantity on the product
+          const newProductQuantity = product.quantity + quantityChange;
+          await tx.product.update({
+            where: { id: item.productId },
+            data: { quantity: newProductQuantity },
+          });
         }
 
-        const quantityChange = type === 'PURCHASE' ? Number(item.quantity) : -Number(item.quantity);
-        
-        // Calculate the specific running balance for THIS new row based on past ledger entries
-        const currentBalanceResult: any = await tx.$queryRaw`
-          SELECT COALESCE(SUM("quantityChange"), 0) AS balance_before
-          FROM "StockLedger"
-          WHERE "productId" = ${item.productId}
-            AND date < ${invoiceDate}::TIMESTAMP
-        `;
-        
-        const balanceBefore = currentBalanceResult[0]?.balance_before ? Number(currentBalanceResult[0].balance_before) : 0;
-        const newRunningBalance = balanceBefore + quantityChange;
-
-        // Insert into ledger
-        await tx.stockLedger.create({
-          data: {
-            productId: item.productId,
-            date: invoiceDate,
-            type: type,
-            quantityChange: quantityChange,
-            runningBalance: newRunningBalance,
-            invoiceId: invoice.id,
-          }
-        });
-
-        // Forward Recalculation for future ledger entries if this was backdated
-        await tx.$queryRaw`
-            UPDATE "StockLedger"
-            SET "runningBalance" = "runningBalance" + ${quantityChange}
-            WHERE "productId" = ${item.productId}
-              AND date > ${invoiceDate}::TIMESTAMP
-        `;
-
-        // Update the cached quantity on the product
-        const newProductQuantity = product.quantity + quantityChange;
-        await tx.product.update({
-          where: { id: item.productId },
-          data: { quantity: newProductQuantity },
-        });
-      }
-
-      // 4. Update Cash Ledger
-      if (finalCashAmount > 0) {
-        const cashQuantityChange = type === 'SALES' ? finalCashAmount : -finalCashAmount;
-        
-        const currentCashBalanceResult: any = await tx.$queryRaw`
-          SELECT COALESCE(SUM("amountChange"), 0) AS balance_before
-          FROM "CashLedger"
-          WHERE "paymentType" = 'CASH'
-            AND date < ${invoiceDate}::TIMESTAMP
-        `;
-        const cashBalanceBefore = currentCashBalanceResult[0]?.balance_before ? Number(currentCashBalanceResult[0].balance_before) : 0;
-        const newCashRunningBalance = cashBalanceBefore + cashQuantityChange;
-
-        await tx.cashLedger.create({
-          data: {
-            date: invoiceDate,
-            paymentType: 'CASH',
-            sourceType: type === 'SALES' ? 'SALE' : 'PURCHASE',
-            amountChange: cashQuantityChange,
-            runningBalance: newCashRunningBalance,
-            invoiceId: invoice.id,
-          }
-        });
-
-        await tx.$queryRaw`
-            UPDATE "CashLedger"
-            SET "runningBalance" = "runningBalance" + ${cashQuantityChange}
+        // 4. Update Cash Ledger
+        if (finalCashAmount > 0) {
+          const cashQuantityChange = type === 'SALES' ? finalCashAmount : -finalCashAmount;
+          
+          const currentCashBalanceResult: any = await tx.$queryRaw`
+            SELECT COALESCE(SUM("amountChange"), 0) AS balance_before
+            FROM "CashLedger"
             WHERE "paymentType" = 'CASH'
-              AND date > ${invoiceDate}::TIMESTAMP
-        `;
-      }
+              AND date < ${invoiceDate}::TIMESTAMP
+          `;
+          const cashBalanceBefore = currentCashBalanceResult[0]?.balance_before ? Number(currentCashBalanceResult[0].balance_before) : 0;
+          const newCashRunningBalance = cashBalanceBefore + cashQuantityChange;
 
-      if (finalBankAmount > 0) {
-        const bankQuantityChange = type === 'SALES' ? finalBankAmount : -finalBankAmount;
-        
-        const currentBankBalanceResult: any = await tx.$queryRaw`
-          SELECT COALESCE(SUM("amountChange"), 0) AS balance_before
-          FROM "CashLedger"
-          WHERE "paymentType" = 'BANK'
-            AND date < ${invoiceDate}::TIMESTAMP
-        `;
-        const bankBalanceBefore = currentBankBalanceResult[0]?.balance_before ? Number(currentBankBalanceResult[0].balance_before) : 0;
-        const newBankRunningBalance = bankBalanceBefore + bankQuantityChange;
+          await tx.cashLedger.create({
+            data: {
+              date: invoiceDate,
+              paymentType: 'CASH',
+              sourceType: type === 'SALES' ? 'SALE' : 'PURCHASE',
+              amountChange: cashQuantityChange,
+              runningBalance: newCashRunningBalance,
+              invoiceId: invoice.id,
+            }
+          });
 
-        await tx.cashLedger.create({
-          data: {
-            date: invoiceDate,
-            paymentType: 'BANK',
-            sourceType: type === 'SALES' ? 'SALE' : 'PURCHASE',
-            amountChange: bankQuantityChange,
-            runningBalance: newBankRunningBalance,
-            invoiceId: invoice.id,
-          }
-        });
+          await tx.$queryRaw`
+              UPDATE "CashLedger"
+              SET "runningBalance" = "runningBalance" + ${cashQuantityChange}
+              WHERE "paymentType" = 'CASH'
+                AND date > ${invoiceDate}::TIMESTAMP
+          `;
+        }
 
-        await tx.$queryRaw`
-            UPDATE "CashLedger"
-            SET "runningBalance" = "runningBalance" + ${bankQuantityChange}
+        if (finalBankAmount > 0) {
+          const bankQuantityChange = type === 'SALES' ? finalBankAmount : -finalBankAmount;
+          
+          const currentBankBalanceResult: any = await tx.$queryRaw`
+            SELECT COALESCE(SUM("amountChange"), 0) AS balance_before
+            FROM "CashLedger"
             WHERE "paymentType" = 'BANK'
-              AND date > ${invoiceDate}::TIMESTAMP
-        `;
-      }
+              AND date < ${invoiceDate}::TIMESTAMP
+          `;
+          const bankBalanceBefore = currentBankBalanceResult[0]?.balance_before ? Number(currentBankBalanceResult[0].balance_before) : 0;
+          const newBankRunningBalance = bankBalanceBefore + bankQuantityChange;
 
-      if (finalMobileMoneyAmount > 0) {
-        const mmQuantityChange = type === 'SALES' ? finalMobileMoneyAmount : -finalMobileMoneyAmount;
-        
-        const currentMMBalanceResult: any = await tx.$queryRaw`
-          SELECT COALESCE(SUM("amountChange"), 0) AS balance_before
-          FROM "CashLedger"
-          WHERE "paymentType" = 'MOBILE_MONEY'
-            AND date < ${invoiceDate}::TIMESTAMP
-        `;
-        const mmBalanceBefore = currentMMBalanceResult[0]?.balance_before ? Number(currentMMBalanceResult[0].balance_before) : 0;
-        const newMMRunningBalance = mmBalanceBefore + mmQuantityChange;
+          await tx.cashLedger.create({
+            data: {
+              date: invoiceDate,
+              paymentType: 'BANK',
+              sourceType: type === 'SALES' ? 'SALE' : 'PURCHASE',
+              amountChange: bankQuantityChange,
+              runningBalance: newBankRunningBalance,
+              invoiceId: invoice.id,
+            }
+          });
 
-        await tx.cashLedger.create({
-          data: {
-            date: invoiceDate,
-            paymentType: 'MOBILE_MONEY',
-            sourceType: type === 'SALES' ? 'SALE' : 'PURCHASE',
-            amountChange: mmQuantityChange,
-            runningBalance: newMMRunningBalance,
-            invoiceId: invoice.id,
-          }
-        });
+          await tx.$queryRaw`
+              UPDATE "CashLedger"
+              SET "runningBalance" = "runningBalance" + ${bankQuantityChange}
+              WHERE "paymentType" = 'BANK'
+                AND date > ${invoiceDate}::TIMESTAMP
+          `;
+        }
 
-        await tx.$queryRaw`
-            UPDATE "CashLedger"
-            SET "runningBalance" = "runningBalance" + ${mmQuantityChange}
+        if (finalMobileMoneyAmount > 0) {
+          const mmQuantityChange = type === 'SALES' ? finalMobileMoneyAmount : -finalMobileMoneyAmount;
+          
+          const currentMMBalanceResult: any = await tx.$queryRaw`
+            SELECT COALESCE(SUM("amountChange"), 0) AS balance_before
+            FROM "CashLedger"
             WHERE "paymentType" = 'MOBILE_MONEY'
-              AND date > ${invoiceDate}::TIMESTAMP
-        `;
+              AND date < ${invoiceDate}::TIMESTAMP
+          `;
+          const mmBalanceBefore = currentMMBalanceResult[0]?.balance_before ? Number(currentMMBalanceResult[0].balance_before) : 0;
+          const newMMRunningBalance = mmBalanceBefore + mmQuantityChange;
+
+          await tx.cashLedger.create({
+            data: {
+              date: invoiceDate,
+              paymentType: 'MOBILE_MONEY',
+              sourceType: type === 'SALES' ? 'SALE' : 'PURCHASE',
+              amountChange: mmQuantityChange,
+              runningBalance: newMMRunningBalance,
+              invoiceId: invoice.id,
+            }
+          });
+
+          await tx.$queryRaw`
+              UPDATE "CashLedger"
+              SET "runningBalance" = "runningBalance" + ${mmQuantityChange}
+              WHERE "paymentType" = 'MOBILE_MONEY'
+                AND date > ${invoiceDate}::TIMESTAMP
+          `;
+        }
       }
 
       return invoice;
@@ -642,54 +711,149 @@ router.put('/:id', async (req: Request, res: Response) => {
     const totalAmount = itemsTotal + numShippingCharge + numLaborCost;
 
     const invoiceDate = new Date(date || existingInvoice.date);
+    const oldIsDraft = !existingInvoice.status || String(existingInvoice.status).trim().toLowerCase() === 'draft';
+    const newIsDraft = status !== undefined 
+      ? (!status || String(status).trim().toLowerCase() === 'draft')
+      : oldIsDraft;
 
     const result = await prisma.$transaction(async (tx) => {
-      // 1. REVERT PREVIOUS STOCK
-      for (const oldItem of existingInvoice.items) {
-        if (!oldItem.productId) continue;
-        const oldQty = Math.round(Number(oldItem.quantity));
-        const revertQty = existingInvoice.type === 'PURCHASE' ? -oldQty : oldQty;
+      // 1. REVERT PREVIOUS STOCK ONLY IF PREVIOUS INVOICE WAS NOT DRAFT
+      if (!oldIsDraft) {
+        for (const oldItem of existingInvoice.items) {
+          if (!oldItem.productId) continue;
+          const oldQty = Math.round(Number(oldItem.quantity));
+          const revertQty = existingInvoice.type === 'PURCHASE' ? -oldQty : oldQty;
 
-        await tx.product.update({
-          where: { id: oldItem.productId },
-          data: { quantity: { increment: revertQty } }
-        });
+          await tx.product.update({
+            where: { id: oldItem.productId },
+            data: { quantity: { increment: revertQty } }
+          });
 
-        await tx.$queryRaw`
-          UPDATE "StockLedger"
-          SET "runningBalance" = "runningBalance" + ${revertQty}
-          WHERE "productId" = ${oldItem.productId}
-            AND date > ${existingInvoice.date}::TIMESTAMP
-        `;
+          await tx.$queryRaw`
+            UPDATE "StockLedger"
+            SET "runningBalance" = "runningBalance" + ${revertQty}
+            WHERE "productId" = ${oldItem.productId}
+              AND date > ${existingInvoice.date}::TIMESTAMP
+          `;
+        }
+
+        // 2. REVERT PREVIOUS CASH LEDGER
+        const oldCashLedgers = await tx.cashLedger.findMany({ where: { invoiceId: id } });
+        for (const cl of oldCashLedgers) {
+          const revertCash = -Number(cl.amountChange);
+          await tx.$queryRaw`
+            UPDATE "CashLedger"
+            SET "runningBalance" = "runningBalance" + ${revertCash}
+            WHERE "paymentType" = ${cl.paymentType}::"PaymentType"
+              AND date > ${cl.date}::TIMESTAMP
+          `;
+        }
+
+        // Delete old ledger entries for this invoice
+        await tx.stockLedger.deleteMany({ where: { invoiceId: id } });
+        await tx.cashLedger.deleteMany({ where: { invoiceId: id } });
       }
 
-      // 2. REVERT PREVIOUS CASH LEDGER
-      const oldCashLedgers = await tx.cashLedger.findMany({ where: { invoiceId: id } });
-      for (const cl of oldCashLedgers) {
-        const revertCash = -Number(cl.amountChange);
-        await tx.$queryRaw`
-          UPDATE "CashLedger"
-          SET "runningBalance" = "runningBalance" + ${revertCash}
-          WHERE "paymentType" = ${cl.paymentType}::"PaymentType"
-            AND date > ${cl.date}::TIMESTAMP
-        `;
-      }
-
-      // Delete old ledger entries & line items for this invoice
-      await tx.stockLedger.deleteMany({ where: { invoiceId: id } });
-      await tx.cashLedger.deleteMany({ where: { invoiceId: id } });
+      // Delete old line items for this invoice
       await tx.invoiceItem.deleteMany({ where: { invoiceId: id } });
 
-      // 3. CHECK POINT-IN-TIME STOCK IF SALES INVOICE
-      for (const item of items) {
-        if (type === 'SALES') {
+      // 3. CHECK POINT-IN-TIME STOCK IF SALES INVOICE AND NOT DRAFT
+      if (!newIsDraft && type === 'SALES') {
+        for (const item of items) {
           const currentProduct = await tx.product.findUnique({ where: { id: item.productId } });
           const totalRequestedQty = items
             .filter((i: any) => i.productId === item.productId)
             .reduce((sum: number, i: any) => sum + Number(i.quantity), 0);
 
           if (!currentProduct || currentProduct.quantity < totalRequestedQty) {
-            throw new Error(`Insufficient stock for product "${currentProduct?.name || item.productId}". Available: ${currentProduct?.quantity || 0}, requested: ${totalRequestedQty}`);
+            throw new Error(`Insufficient current stock for "${currentProduct?.name || item.productId}". Available today: ${currentProduct?.quantity || 0}, requested: ${totalRequestedQty}`);
+          }
+
+          // 1. Strict Point-in-Time Check on update
+          const balanceAtDateResult: any = await tx.$queryRaw`
+            SELECT COALESCE(SUM("quantityChange"), 0) AS balance_at_date
+            FROM "StockLedger"
+            WHERE "productId" = ${item.productId}
+              AND date <= ${invoiceDate}::TIMESTAMP
+          `;
+          const balanceAtDate = balanceAtDateResult[0]?.balance_at_date !== undefined
+            ? Number(balanceAtDateResult[0].balance_at_date)
+            : 0;
+
+          if (balanceAtDate < totalRequestedQty) {
+            const firstArrivalResult: any = await tx.$queryRaw`
+              SELECT MIN(date) AS first_date
+              FROM "StockLedger"
+              WHERE "productId" = ${item.productId}
+                AND "quantityChange" > 0
+            `;
+            const firstDateStr = firstArrivalResult[0]?.first_date
+              ? new Date(firstArrivalResult[0].first_date).toLocaleDateString('en-GB')
+              : (currentProduct.createdAt ? new Date(currentProduct.createdAt).toLocaleDateString('en-GB') : 'a later date');
+            const invDateStr = invoiceDate.toLocaleDateString('en-GB');
+
+            throw new Error(
+              `Strict Audit Check Failed: Item "${currentProduct.name}" had only ${balanceAtDate} in stock on ${invDateStr} (requested: ${totalRequestedQty}). Stock first became available on ${firstDateStr}. To sell this item, change the invoice date to ${firstDateStr} or later, or backdate the purchase receipt.`
+            );
+          }
+
+          // 2. Strict Chronological Future-Dip Check on update
+          const quantityChange = -Number(item.quantity);
+          const minBalanceResult: any = await tx.$queryRaw`
+            WITH proposed_ledger AS (
+                SELECT date, "quantityChange"
+                FROM "StockLedger"
+                WHERE "productId" = ${item.productId}
+                
+                UNION ALL
+                
+                SELECT ${invoiceDate}::TIMESTAMP, ${quantityChange}::INTEGER
+            ),
+            cumulative_calculation AS (
+                SELECT 
+                    date,
+                    SUM("quantityChange") OVER (ORDER BY date ASC) AS cumulative_balance
+                FROM proposed_ledger
+            )
+            SELECT MIN(cumulative_balance) AS min_future_balance
+            FROM cumulative_calculation
+            WHERE date >= ${invoiceDate}::TIMESTAMP;
+          `;
+          
+          const rawMin = minBalanceResult[0]?.min_future_balance;
+          const minFutureBalance =
+            rawMin !== undefined && rawMin !== null ? Number(rawMin) : quantityChange;
+          
+          if (minFutureBalance < 0) {
+            const dipRowResult: any = await tx.$queryRaw`
+              WITH proposed_ledger AS (
+                  SELECT date, "quantityChange"
+                  FROM "StockLedger"
+                  WHERE "productId" = ${item.productId}
+                  
+                  UNION ALL
+                  
+                  SELECT ${invoiceDate}::TIMESTAMP, ${quantityChange}::INTEGER
+              ),
+              cumulative_calculation AS (
+                  SELECT 
+                      date,
+                      SUM("quantityChange") OVER (ORDER BY date ASC) AS cumulative_balance
+                  FROM proposed_ledger
+              )
+              SELECT date, cumulative_balance
+              FROM cumulative_calculation
+              WHERE date >= ${invoiceDate}::TIMESTAMP AND cumulative_balance < 0
+              ORDER BY date ASC
+              LIMIT 1;
+            `;
+            const dipDateStr = dipRowResult[0]?.date
+              ? new Date(dipRowResult[0].date).toLocaleDateString('en-GB')
+              : invoiceDate.toLocaleDateString('en-GB');
+
+            throw new Error(
+              `Strict Audit Check Failed: Selling on ${invoiceDate.toLocaleDateString('en-GB')} causes inventory for "${currentProduct.name}" to drop below zero (deficit of ${Math.abs(minFutureBalance)}) on subsequent date ${dipDateStr}.`
+            );
           }
         }
       }
@@ -720,7 +884,7 @@ router.put('/:id', async (req: Request, res: Response) => {
           mobileMoneyAmount: finalMobileMoneyAmount,
           imageUrl: imageUrl !== undefined ? (imageUrl || null) : existingInvoice.imageUrl,
           attachments: attachments !== undefined ? (attachments || null) : (existingInvoice.attachments as any),
-          status: status !== undefined ? status : ((existingInvoice as any).status || 'Draft'),
+          status: newIsDraft ? 'Draft' : (status || 'Submitted'),
           items: {
             create: items.map((item: any) => ({
               productId: item.productId,
@@ -739,8 +903,9 @@ router.put('/:id', async (req: Request, res: Response) => {
         },
       });
 
-      // 5. APPLY NEW INVENTORY & STOCK LEDGER
-      for (const item of items) {
+      // 5. APPLY NEW INVENTORY & STOCK LEDGER ONLY IF SUBMITTING (NOT DRAFT)
+      if (!newIsDraft) {
+        for (const item of items) {
         const product = await tx.product.findUnique({ where: { id: item.productId } });
         if (!product) throw new Error(`Product with ID ${item.productId} not found`);
 
@@ -869,6 +1034,7 @@ router.put('/:id', async (req: Request, res: Response) => {
           WHERE "paymentType" = 'MOBILE_MONEY'
             AND date > ${invoiceDate}::TIMESTAMP
         `;
+      }
       }
 
       return updatedInvoice;
@@ -1483,7 +1649,50 @@ router.post('/bulk-upload', upload.single('file'), async (req: Request, res: Res
 router.delete('/:id', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
+    const existingInvoice = await prisma.invoice.findUnique({
+      where: { id },
+      include: { items: true },
+    });
+
+    if (!existingInvoice) {
+      return res.status(404).json({ error: 'Invoice not found' });
+    }
+
+    const wasDraft = !existingInvoice.status || String(existingInvoice.status).trim().toLowerCase() === 'draft';
+
     await prisma.$transaction(async (tx) => {
+      // Revert stock and cash ledger only if it was NOT a draft
+      if (!wasDraft) {
+        for (const item of existingInvoice.items) {
+          if (!item.productId) continue;
+          const qty = Math.round(Number(item.quantity));
+          const revertQty = existingInvoice.type === 'PURCHASE' ? -qty : qty;
+
+          await tx.product.update({
+            where: { id: item.productId },
+            data: { quantity: { increment: revertQty } }
+          });
+
+          await tx.$queryRaw`
+            UPDATE "StockLedger"
+            SET "runningBalance" = "runningBalance" + ${revertQty}
+            WHERE "productId" = ${item.productId}
+              AND date > ${existingInvoice.date}::TIMESTAMP
+          `;
+        }
+
+        const oldCashLedgers = await tx.cashLedger.findMany({ where: { invoiceId: id } });
+        for (const cl of oldCashLedgers) {
+          const revertCash = -Number(cl.amountChange);
+          await tx.$queryRaw`
+            UPDATE "CashLedger"
+            SET "runningBalance" = "runningBalance" + ${revertCash}
+            WHERE "paymentType" = ${cl.paymentType}::"PaymentType"
+              AND date > ${cl.date}::TIMESTAMP
+          `;
+        }
+      }
+
       await tx.invoiceItem.deleteMany({ where: { invoiceId: id } });
       await tx.stockLedger.deleteMany({ where: { invoiceId: id } });
       await tx.cashLedger.deleteMany({ where: { invoiceId: id } });
