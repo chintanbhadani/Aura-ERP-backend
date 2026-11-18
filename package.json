@@ -13,7 +13,11 @@
     "db:migrate:dev": "prisma migrate dev",
     "db:clear": "node scripts/clear-test-data.js",
     "db:clear:all": "node scripts/clear-test-data.js --all",
-    "db:wipe": "node scripts/clear-test-data.js --wipe-all"
+    "db:wipe": "node scripts/clear-test-data.js --wipe-all",
+    "bot:lockdown": "node scripts/telegram-lockdown-bot.js",
+    "lockdown:on": "node -e \"const fs=require('fs'); fs.writeFileSync('maintenance.flag', JSON.stringify({lockedAt:new Date().toISOString(),by:'CLI'})); console.log('🔴 Maintenance Flag Created');\"",
+    "lockdown:off": "node -e \"const fs=require('fs'); if(fs.existsSync('maintenance.flag')) fs.unlinkSync('maintenance.flag'); console.log('🟢 Maintenance Flag Removed');\"",
+    "lockdown:status": "node -e \"const fs=require('fs'); console.log(fs.existsSync('maintenance.flag')?'🔴 LOCKED DOWN (Maintenance Active)':'🟢 ONLINE');\""
   },
   "dependencies": {
     "@prisma/client": "^5.22.0",

@@ -4,6 +4,7 @@ dotenv.config();
 import express from 'express';
 import cors from 'cors';
 import path from 'path';
+import fs from 'fs';
 import inventoryRoutes from './routes/inventory.routes'; // TS should resolve this to inventory.routes.ts
 
 
@@ -12,6 +13,46 @@ const PORT = process.env.PORT || 8000;
 
 app.use(cors());
 app.use(express.json());
+
+// Maintenance Flag Paths
+const candidateFlagPaths = [
+  process.env.MAINTENANCE_FLAG_PATH,
+  '/var/www/auraerp/maintenance.flag',
+  path.resolve(__dirname, '../../maintenance.flag'),
+  path.resolve(__dirname, '../maintenance.flag')
+].filter(Boolean) as string[];
+
+const isMaintenanceActive = () => {
+  return candidateFlagPaths.some(p => fs.existsSync(p));
+};
+
+// Emergency Security Lockdown Middleware (Returns 503 when flag is present)
+app.use((req, res, next) => {
+  if (req.path === '/health' || req.path === '/api/health' || req.path === '/api/system/maintenance') {
+    return next();
+  }
+
+  if (isMaintenanceActive()) {
+    return res.status(503).json({
+      error: 'Service Temporarily Unavailable',
+      message: 'Aura ERP is currently undergoing security maintenance. All requests are temporarily paused.',
+      maintenance: true,
+      statusCode: 503
+    });
+  }
+
+  next();
+});
+
+// Maintenance Status Endpoint
+app.get('/api/system/maintenance', (req, res) => {
+  const active = isMaintenanceActive();
+  res.json({
+    maintenance: active,
+    status: active ? 'LOCKED_DOWN' : 'ONLINE',
+    message: active ? 'Service is temporarily unavailable (503)' : 'All systems operational'
+  });
+});
 
 // Serve uploaded files statically
 app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
@@ -35,6 +76,7 @@ import roleRoutes from './routes/role.routes';
 import repackRoutes from './routes/repack.routes';
 import uploadRoutes from './routes/upload.routes';
 import stockCountRoutes from './routes/stockCount.routes';
+import { startTelegramLockdownBot } from './services/telegramBotService';
 
 // Routes setup
 app.get('/health', (req, res) => {
@@ -77,4 +119,6 @@ app.use((err: any, req: express.Request, res: express.Response, next: express.Ne
 
 app.listen(PORT, () => {
   console.log(`HTTP API Server running on port ${PORT}`);
+  // Start the Emergency Telegram Lockdown Bot if credentials are configured
+  startTelegramLockdownBot();
 });
