@@ -90,6 +90,11 @@ router.get('/', async (req: Request, res: Response) => {
 router.get('/available-batches/:productId', async (req: Request, res: Response) => {
   try {
     const { productId } = req.params;
+    const { invoiceDate } = req.query;
+    const invoiceDateObj = invoiceDate ? new Date(String(invoiceDate)) : null;
+    if (invoiceDateObj) {
+      invoiceDateObj.setHours(23, 59, 59, 999);
+    }
 
     const product = await prisma.product.findUnique({
       where: { id: productId },
@@ -185,6 +190,8 @@ router.get('/available-batches/:productId', async (req: Request, res: Response) 
     }
 
     const batches = [];
+    let futureBatchCount = 0;
+    let nextAvailableBatchDate: Date | null = null;
 
     // Add batches from purchase invoices
     for (const pi of purchaseItems) {
@@ -192,6 +199,15 @@ router.get('/available-batches/:productId', async (req: Request, res: Response) 
       const available = pi.quantity - sold;
 
       if (available > 0) {
+        const batchDate = new Date(pi.invoice.date);
+        const isFutureBatch = Boolean(invoiceDateObj && batchDate > invoiceDateObj);
+        if (isFutureBatch) {
+          futureBatchCount++;
+          if (!nextAvailableBatchDate || batchDate < nextAvailableBatchDate) {
+            nextAvailableBatchDate = batchDate;
+          }
+        }
+
         batches.push({
           purchaseItemId: pi.id,
           poNumber: pi.invoice.invoiceNumber,
@@ -199,13 +215,27 @@ router.get('/available-batches/:productId', async (req: Request, res: Response) 
           supplierName: pi.invoice.supplier?.name || 'Direct Purchase',
           unitCost: Number(pi.unitPrice),
           initialQuantity: pi.quantity,
-          availableQuantity: available,
+          availableQuantity: isFutureBatch ? 0 : available,
+          totalBatchQuantity: available,
+          isFutureBatch,
+          futureArrivalDate: isFutureBatch ? batchDate.toISOString() : null,
+          batchWarning: isFutureBatch 
+            ? `Arrives on ${batchDate.toLocaleDateString('en-GB')}. Not available on invoice date.` 
+            : undefined,
         });
       }
     }
 
     // Only fallback to INITIAL-STOCK if NO purchase invoice/PO has ever been created for this product
     if (purchaseItems.length === 0 && product.quantity > 0) {
+      const initDate = product.createdAt ? new Date(product.createdAt) : new Date('2020-01-01');
+      const isFutureInitial = Boolean(invoiceDateObj && initDate > invoiceDateObj);
+      if (isFutureInitial) {
+        if (!nextAvailableBatchDate || initDate < nextAvailableBatchDate) {
+          nextAvailableBatchDate = initDate;
+        }
+      }
+
       batches.unshift({
         purchaseItemId: 'INITIAL',
         poNumber: 'INITIAL-STOCK',
@@ -213,8 +243,26 @@ router.get('/available-batches/:productId', async (req: Request, res: Response) 
         supplierName: 'Opening Stock',
         unitCost: Number(product.cost_price),
         initialQuantity: product.quantity,
-        availableQuantity: product.quantity,
+        availableQuantity: isFutureInitial ? 0 : product.quantity,
+        totalBatchQuantity: product.quantity,
+        isFutureBatch: isFutureInitial,
+        futureArrivalDate: isFutureInitial ? initDate.toISOString() : null,
       });
+    }
+
+    const hasAvailableBatchesOnDate = batches.some(b => !b.isFutureBatch && b.availableQuantity > 0);
+    const targetDateFormatted = invoiceDateObj ? new Date(String(invoiceDate)).toLocaleDateString('en-GB') : null;
+    const formattedNextBatchDate = nextAvailableBatchDate ? nextAvailableBatchDate.toLocaleDateString('en-GB') : null;
+
+    let statusMessage = '';
+    if (hasAvailableBatchesOnDate) {
+      statusMessage = 'Batches available for allocation';
+    } else if (targetDateFormatted && formattedNextBatchDate) {
+      statusMessage = `Stock not available on ${targetDateFormatted}. Stock will be available on ${formattedNextBatchDate}.`;
+    } else if (targetDateFormatted) {
+      statusMessage = `Stock not available on ${targetDateFormatted}.`;
+    } else {
+      statusMessage = 'Stock not available';
     }
 
     res.json({
@@ -224,6 +272,10 @@ router.get('/available-batches/:productId', async (req: Request, res: Response) 
       totalStock: product.quantity,
       defaultSellingPrice: Number(product.selling_price),
       batches,
+      hasAvailableBatchesOnDate,
+      nextAvailableBatchDate: nextAvailableBatchDate ? nextAvailableBatchDate.toISOString() : null,
+      formattedNextBatchDate,
+      statusMessage
     });
   } catch (error: any) {
     console.error('Error fetching available batches:', error);
@@ -681,6 +733,16 @@ router.put('/:id', async (req: Request, res: Response) => {
 
     if (!existingInvoice) {
       return res.status(404).json({ error: 'Invoice not found' });
+    }
+
+    if (existingInvoice.status === 'Cancelled') {
+      return res.status(400).json({ error: 'Cannot edit a cancelled invoice' });
+    }
+
+    if (existingInvoice.status === 'Submitted') {
+      return res.status(400).json({
+        error: 'Cannot edit submitted invoice: Modifying date or stock quantities on a submitted invoice causes stock ledger inconsistencies. Please cancel the invoice and create a new invoice instead.'
+      });
     }
 
     if (!type || !items || !items.length) {
@@ -1642,6 +1704,199 @@ router.post('/bulk-upload', upload.single('file'), async (req: Request, res: Res
   } catch (error: any) {
     console.error('Bulk upload invoices error:', error);
     res.status(500).json({ error: error.message || 'Failed to process bulk upload' });
+  }
+});
+
+// POST cancel invoice by id
+router.post('/:id/cancel', async (req: Request, res: Response) => {
+  try {
+    await ensureInvoiceColumns();
+    const { id } = req.params;
+    const existingInvoice = await prisma.invoice.findUnique({
+      where: { id },
+      include: { items: true },
+    });
+
+    if (!existingInvoice) {
+      return res.status(404).json({ error: 'Invoice not found' });
+    }
+
+    if (existingInvoice.status === 'Cancelled') {
+      return res.status(400).json({ error: 'Invoice is already cancelled' });
+    }
+
+    const isDraft = !existingInvoice.status || String(existingInvoice.status).trim().toLowerCase() === 'draft';
+
+    // 1. SALES INVOICE CANCELLATION RULE:
+    // Only cancel if sales invoice in draft status
+    if (existingInvoice.type === 'SALES') {
+      if (!isDraft) {
+        return res.status(400).json({
+          error: 'Cannot cancel Sales Invoice: Only draft sales invoices can be cancelled. Submitted sales invoices cannot be cancelled.'
+        });
+      }
+
+      const updated = await prisma.invoice.update({
+        where: { id },
+        data: { status: 'Cancelled' },
+      });
+
+      return res.json({
+        message: 'Draft sales invoice cancelled successfully.',
+        invoice: updated,
+      });
+    }
+
+    // 2. PURCHASE INVOICE CANCELLATION RULE:
+    // Purchase invoice only cancel if this item not use in sales invoice
+    if (existingInvoice.type === 'PURCHASE') {
+      const purchaseItemIds = existingInvoice.items.map((i: any) => i.id);
+
+      // Check if any item from this purchase invoice has been used in sales invoices
+      const directSalesItems = await prisma.invoiceItem.findMany({
+        where: {
+          invoice: {
+            type: 'SALES',
+            status: { not: 'Cancelled' },
+          },
+          OR: [
+            { purchaseItemId: { in: purchaseItemIds } },
+            { purchaseInvoiceNo: existingInvoice.invoiceNumber },
+          ],
+        },
+        include: {
+          invoice: { select: { invoiceNumber: true } },
+          product: { select: { name: true } },
+        },
+      });
+
+      // Check poAllocations in active sales invoices
+      const salesWithAllocations = await prisma.invoiceItem.findMany({
+        where: {
+          invoice: {
+            type: 'SALES',
+            status: { not: 'Cancelled' },
+          },
+          poAllocations: { not: Prisma.JsonNull },
+        },
+        include: {
+          invoice: { select: { invoiceNumber: true } },
+          product: { select: { name: true } },
+        },
+      });
+
+      const usedSalesInvoices = new Set<string>();
+      const usedProducts = new Set<string>();
+
+      for (const item of directSalesItems) {
+        usedSalesInvoices.add(item.invoice.invoiceNumber);
+        if (item.product?.name) usedProducts.add(item.product.name);
+      }
+
+      for (const item of salesWithAllocations) {
+        if (Array.isArray(item.poAllocations)) {
+          for (const alloc of item.poAllocations as any[]) {
+            if (
+              purchaseItemIds.includes(alloc.purchaseItemId) ||
+              alloc.poNumber === existingInvoice.invoiceNumber
+            ) {
+              usedSalesInvoices.add(item.invoice.invoiceNumber);
+              if (item.product?.name) usedProducts.add(item.product.name);
+            }
+          }
+        }
+      }
+
+      // Check Repack entries
+      const repacks = await prisma.repackEntry.findMany({
+        where: {
+          purchaseItemId: { in: purchaseItemIds },
+        },
+      });
+
+      if (usedSalesInvoices.size > 0) {
+        const invList = Array.from(usedSalesInvoices).join(', ');
+        const prodList = Array.from(usedProducts).join(', ');
+        return res.status(400).json({
+          error: `Cannot cancel Purchase Invoice: Item(s) (${prodList || 'items'}) from this purchase invoice have already been used in Sales Invoice (${invList}). You cannot cancel a purchase invoice whose stock has already been sold.`
+        });
+      }
+
+      if (repacks.length > 0) {
+        return res.status(400).json({
+          error: 'Cannot cancel Purchase Invoice: Items from this purchase invoice have already been consumed in Repack operations.'
+        });
+      }
+
+      // Check if reversing stock would cause product quantity to become negative
+      if (!isDraft) {
+        for (const item of existingInvoice.items) {
+          if (!item.productId) continue;
+          const currentProd = await prisma.product.findUnique({ where: { id: item.productId } });
+          const purchaseQty = Math.round(Number(item.quantity));
+          if (currentProd && currentProd.quantity < purchaseQty) {
+            return res.status(400).json({
+              error: `Cannot cancel Purchase Invoice: Stock for "${currentProd.name}" is already reduced to ${currentProd.quantity} (purchased: ${purchaseQty}). Items have already been consumed.`
+            });
+          }
+        }
+      }
+
+      // Execute cancellation in transaction
+      const updated = await prisma.$transaction(async (tx) => {
+        if (!isDraft) {
+          // Revert stock from Product and StockLedger
+          for (const item of existingInvoice.items) {
+            if (!item.productId) continue;
+            const qty = Math.round(Number(item.quantity));
+            const revertQty = -qty; // Purchase added stock, so cancel subtracts it
+
+            await tx.product.update({
+              where: { id: item.productId },
+              data: { quantity: { increment: revertQty } },
+            });
+
+            await tx.$queryRaw`
+              UPDATE "StockLedger"
+              SET "runningBalance" = "runningBalance" + ${revertQty}
+              WHERE "productId" = ${item.productId}
+                AND date > ${existingInvoice.date}::TIMESTAMP
+            `;
+          }
+
+          // Revert CashLedger
+          const oldCashLedgers = await tx.cashLedger.findMany({ where: { invoiceId: id } });
+          for (const cl of oldCashLedgers) {
+            const revertCash = -Number(cl.amountChange);
+            await tx.$queryRaw`
+              UPDATE "CashLedger"
+              SET "runningBalance" = "runningBalance" + ${revertCash}
+              WHERE "paymentType" = ${cl.paymentType}::"PaymentType"
+                AND date > ${cl.date}::TIMESTAMP
+            `;
+          }
+
+          // Delete stockLedgers and cashLedgers for this purchase invoice
+          await tx.stockLedger.deleteMany({ where: { invoiceId: id } });
+          await tx.cashLedger.deleteMany({ where: { invoiceId: id } });
+        }
+
+        return tx.invoice.update({
+          where: { id },
+          data: { status: 'Cancelled' },
+        });
+      });
+
+      return res.json({
+        message: 'Purchase invoice cancelled successfully. Stock has been safely reverted. You can now create a new invoice.',
+        invoice: updated,
+      });
+    }
+
+    return res.status(400).json({ error: 'Unsupported invoice type' });
+  } catch (error: any) {
+    console.error('Error cancelling invoice:', error);
+    res.status(500).json({ error: error.message || 'Failed to cancel invoice' });
   }
 });
 

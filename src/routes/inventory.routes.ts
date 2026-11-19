@@ -139,41 +139,103 @@ router.get('/stock-as-of-date', async (req: Request, res: Response) => {
         p.sku,
         p.quantity AS "currentStock",
         p."createdAt" AS "productCreatedAt",
-        COALESCE(SUM(sl."quantityChange"), 0)::INTEGER AS "ledgerSumAtDate",
-        COALESCE(all_sl."totalLedgerSum", 0)::INTEGER AS "totalLedgerSum",
-        MIN(CASE WHEN sl."quantityChange" > 0 THEN sl.date END) AS "firstStockDate"
+        -- Cumulative stock ledger balance on or before target date
+        COALESCE((
+          SELECT SUM(sl."quantityChange") 
+          FROM "StockLedger" sl 
+          WHERE sl."productId" = p.id AND sl.date <= ${endOfDay}::TIMESTAMP
+        ), 0)::INTEGER AS "ledgerSumAtDate",
+        -- Earliest stock arrival date in the FUTURE (after target date)
+        (
+          SELECT MIN(d.dt) FROM (
+            SELECT sl.date AS dt 
+            FROM "StockLedger" sl 
+            WHERE sl."productId" = p.id AND sl."quantityChange" > 0 AND sl.date > ${endOfDay}::TIMESTAMP
+            UNION ALL
+            SELECT inv.date AS dt 
+            FROM "InvoiceItem" ii
+            JOIN "Invoice" inv ON inv.id = ii."invoiceId"
+            WHERE ii."productId" = p.id AND inv.type = 'PURCHASE' AND inv.date > ${endOfDay}::TIMESTAMP
+          ) d
+        ) AS "nextFutureStockDate",
+        -- Earliest stock arrival date ever
+        (
+          SELECT MIN(d.dt) FROM (
+            SELECT sl.date AS dt 
+            FROM "StockLedger" sl 
+            WHERE sl."productId" = p.id AND sl."quantityChange" > 0
+            UNION ALL
+            SELECT inv.date AS dt 
+            FROM "InvoiceItem" ii
+            JOIN "Invoice" inv ON inv.id = ii."invoiceId"
+            WHERE ii."productId" = p.id AND inv.type = 'PURCHASE'
+          ) d
+        ) AS "earliestStockDate",
+        -- Total inward transactions count ever
+        (
+          SELECT COUNT(*)::INTEGER FROM (
+            SELECT sl.id 
+            FROM "StockLedger" sl 
+            WHERE sl."productId" = p.id AND sl."quantityChange" > 0
+            UNION ALL
+            SELECT ii.id 
+            FROM "InvoiceItem" ii
+            JOIN "Invoice" inv ON inv.id = ii."invoiceId"
+            WHERE ii."productId" = p.id AND inv.type = 'PURCHASE'
+          ) t
+        ) AS "totalInwardCount"
       FROM "Product" p
-      LEFT JOIN "StockLedger" sl 
-        ON sl."productId" = p.id 
-        AND sl.date <= ${endOfDay}::TIMESTAMP
-      LEFT JOIN (
-        SELECT "productId", SUM("quantityChange") AS "totalLedgerSum"
-        FROM "StockLedger"
-        GROUP BY "productId"
-      ) all_sl ON all_sl."productId" = p.id
-      GROUP BY p.id, p.name, p.sku, p.quantity, p."createdAt", all_sl."totalLedgerSum"
     `;
 
-    const resultMap: Record<string, { stockAsOfDate: number; currentStock: number; firstStockDate: string | null; name: string; sku: string }> = {};
+    const resultMap: Record<string, {
+      stockAsOfDate: number;
+      currentStock: number;
+      isAvailable: boolean;
+      nextStockDate: string | null;
+      formattedNextStockDate: string | null;
+      earliestStockDate: string | null;
+      statusMessage: string;
+      name: string;
+      sku: string;
+    }> = {};
+
+    const targetDateFormatted = targetDate.toLocaleDateString('en-GB');
+
     for (const row of stockRows) {
       const currentStock = Number(row.currentStock) || 0;
       const ledgerSumAtDate = Number(row.ledgerSumAtDate) || 0;
-      const totalLedgerSum = Number(row.totalLedgerSum) || 0;
-      const unrecordedInitial = Math.max(0, currentStock - totalLedgerSum);
+      const totalInwardCount = Number(row.totalInwardCount) || 0;
 
-      const isInitialBeforeTarget = row.productCreatedAt && new Date(row.productCreatedAt) <= endOfDay;
-      const initialStockCredit = isInitialBeforeTarget ? unrecordedInitial : 0;
-      const stockAsOfDate = ledgerSumAtDate + initialStockCredit;
+      let stockAsOfDate = 0;
+      if (totalInwardCount > 0) {
+        stockAsOfDate = Math.max(0, ledgerSumAtDate);
+      } else {
+        // Pure opening stock product with no purchase/inward records
+        const isCreatedBefore = row.productCreatedAt && new Date(row.productCreatedAt) <= endOfDay;
+        stockAsOfDate = isCreatedBefore ? currentStock : 0;
+      }
 
-      let firstDate = row.firstStockDate ? new Date(row.firstStockDate) : null;
-      if (!firstDate && unrecordedInitial > 0 && row.productCreatedAt) {
-        firstDate = new Date(row.productCreatedAt);
+      const nextDate = row.nextFutureStockDate ? new Date(row.nextFutureStockDate) : null;
+      const earliestDate = row.earliestStockDate ? new Date(row.earliestStockDate) : null;
+      const formattedNextDate = nextDate ? nextDate.toLocaleDateString('en-GB') : null;
+
+      let statusMessage = '';
+      if (stockAsOfDate > 0) {
+        statusMessage = `${stockAsOfDate} in stock on ${targetDateFormatted}`;
+      } else if (formattedNextDate) {
+        statusMessage = `Stock not available on ${targetDateFormatted}. Stock will be available on ${formattedNextDate}.`;
+      } else {
+        statusMessage = 'Stock not available';
       }
 
       resultMap[row.id] = {
-        stockAsOfDate: Math.max(0, stockAsOfDate),
+        stockAsOfDate,
         currentStock,
-        firstStockDate: firstDate ? firstDate.toISOString() : null,
+        isAvailable: stockAsOfDate > 0,
+        nextStockDate: nextDate ? nextDate.toISOString() : null,
+        formattedNextStockDate: formattedNextDate,
+        earliestStockDate: earliestDate ? earliestDate.toISOString() : null,
+        statusMessage,
         name: row.name,
         sku: row.sku || ''
       };
