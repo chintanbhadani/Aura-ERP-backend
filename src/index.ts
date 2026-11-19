@@ -5,7 +5,7 @@ import express from 'express';
 import cors from 'cors';
 import path from 'path';
 import fs from 'fs';
-import inventoryRoutes from './routes/inventory.routes'; // TS should resolve this to inventory.routes.ts
+import inventoryRoutes, { syncProductQuantitiesWithLedger } from './routes/inventory.routes'; // TS should resolve this to inventory.routes.ts
 
 
 const app = express();
@@ -117,8 +117,10 @@ app.use((err: any, req: express.Request, res: express.Response, next: express.Ne
   res.status(500).json({ error: 'Something went wrong!' });
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`HTTP API Server running on port ${PORT}`);
+  // Run stock reconciliation to heal any desynchronization between Product.quantity and StockLedger
+  await syncProductQuantitiesWithLedger();
   // Start the Emergency Telegram Lockdown Bot if credentials are configured
   startTelegramLockdownBot();
 });

@@ -2,7 +2,7 @@ import { Router, Request, Response } from 'express';
 import { PrismaClient } from '@prisma/client';
 
 const router = Router();
-const prisma = new PrismaClient();
+const prisma = new PrismaClient();  
 
 // GET all stock ledger entries
 router.get('/', async (req: Request, res: Response) => {
@@ -219,13 +219,16 @@ router.post('/', async (req: Request, res: Response) => {
           AND date > ${entryDate}::TIMESTAMP
       `;
 
-      // Update cached product quantity
-      await tx.product.update({
-        where: { id: productId },
-        data: {
-          quantity: product.quantity + change,
-        },
-      });
+      // Update cached product quantity to match exact StockLedger balance
+      await tx.$executeRaw`
+        UPDATE "Product"
+        SET quantity = COALESCE((
+          SELECT SUM(sl."quantityChange")
+          FROM "StockLedger" sl
+          WHERE sl."productId" = ${productId}
+        ), 0)
+        WHERE id = ${productId}
+      `;
 
       return newEntry;
     });
@@ -265,18 +268,21 @@ router.put('/:id', async (req: Request, res: Response) => {
       });
 
       if (diff !== 0) {
-        await tx.product.update({
-          where: { id: existing.productId },
-          data: {
-            quantity: { increment: diff },
-          },
-        });
-
         await tx.$queryRaw`
           UPDATE "StockLedger"
           SET "runningBalance" = "runningBalance" + ${diff}
           WHERE "productId" = ${existing.productId}
             AND date >= ${newDate}::TIMESTAMP
+        `;
+
+        await tx.$executeRaw`
+          UPDATE "Product"
+          SET quantity = COALESCE((
+            SELECT SUM(sl."quantityChange")
+            FROM "StockLedger" sl
+            WHERE sl."productId" = ${existing.productId}
+          ), 0)
+          WHERE id = ${existing.productId}
         `;
       }
 
@@ -299,13 +305,6 @@ router.delete('/:id', async (req: Request, res: Response) => {
     }
 
     await prisma.$transaction(async (tx) => {
-      await tx.product.update({
-        where: { id: existing.productId },
-        data: {
-          quantity: { decrement: existing.quantityChange },
-        },
-      });
-
       await tx.$queryRaw`
         UPDATE "StockLedger"
         SET "runningBalance" = "runningBalance" - ${existing.quantityChange}
@@ -314,6 +313,16 @@ router.delete('/:id', async (req: Request, res: Response) => {
       `;
 
       await tx.stockLedger.delete({ where: { id } });
+
+      await tx.$executeRaw`
+        UPDATE "Product"
+        SET quantity = COALESCE((
+          SELECT SUM(sl."quantityChange")
+          FROM "StockLedger" sl
+          WHERE sl."productId" = ${existing.productId}
+        ), 0)
+        WHERE id = ${existing.productId}
+      `;
     });
 
     res.json({ message: 'Stock entry deleted successfully' });

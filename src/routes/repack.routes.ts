@@ -462,17 +462,55 @@ router.delete('/:id', async (req: Request, res: Response) => {
       const srcQty = Number(entry.sourceQuantity);
       const tgtQty = Number(entry.targetQuantity);
 
-      // Revert Source: add back srcQty
-      await tx.product.update({
-        where: { id: entry.sourceProductId },
-        data: { quantity: { increment: srcQty } }
-      });
+      // Revert StockLedger: delete the corresponding repack ledger entries
+      await tx.$executeRaw`
+        DELETE FROM "StockLedger"
+        WHERE id IN (
+          SELECT id FROM "StockLedger"
+          WHERE "productId" = ${entry.sourceProductId}
+            AND type = 'REPACK_OUT'
+            AND "quantityChange" = -${srcQty}
+            AND date = ${entry.date}::TIMESTAMP
+          LIMIT 1
+        )
+      `;
+      await tx.$executeRaw`
+        DELETE FROM "StockLedger"
+        WHERE id IN (
+          SELECT id FROM "StockLedger"
+          WHERE "productId" = ${entry.targetProductId}
+            AND type = 'REPACK_IN'
+            AND "quantityChange" = ${tgtQty}
+            AND date = ${entry.date}::TIMESTAMP
+          LIMIT 1
+        )
+      `;
 
-      // Revert Target: deduct tgtQty
-      await tx.product.update({
-        where: { id: entry.targetProductId },
-        data: { quantity: { decrement: tgtQty } }
-      });
+      // Update future running balances
+      await tx.$executeRaw`
+        UPDATE "StockLedger"
+        SET "runningBalance" = "runningBalance" + ${srcQty}
+        WHERE "productId" = ${entry.sourceProductId}
+          AND date > ${entry.date}::TIMESTAMP
+      `;
+      await tx.$executeRaw`
+        UPDATE "StockLedger"
+        SET "runningBalance" = "runningBalance" - ${tgtQty}
+        WHERE "productId" = ${entry.targetProductId}
+          AND date > ${entry.date}::TIMESTAMP
+      `;
+
+      // Sync Product.quantity for both products to match true StockLedger sum
+      await tx.$executeRaw`
+        UPDATE "Product"
+        SET quantity = COALESCE((SELECT SUM("quantityChange") FROM "StockLedger" WHERE "productId" = ${entry.sourceProductId}), 0)
+        WHERE id = ${entry.sourceProductId}
+      `;
+      await tx.$executeRaw`
+        UPDATE "Product"
+        SET quantity = COALESCE((SELECT SUM("quantityChange") FROM "StockLedger" WHERE "productId" = ${entry.targetProductId}), 0)
+        WHERE id = ${entry.targetProductId}
+      `;
 
       // Clean up Repack record
       await tx.repackEntry.delete({ where: { id } });

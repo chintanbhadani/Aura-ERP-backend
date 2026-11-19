@@ -1,5 +1,5 @@
 import { Router, Request, Response } from 'express';
-import { PrismaClient } from '@prisma/client';
+import { PrismaClient, Prisma } from '@prisma/client';
 import multer from 'multer';
 import * as xlsx from 'xlsx';
 import logger from '../utils/logger';
@@ -9,9 +9,63 @@ const upload = multer({ storage: multer.memoryStorage() });
 const router = Router();
 const prisma = new PrismaClient();
 
+/**
+ * Self-healing stock reconciler:
+ * Keeps Product.quantity 100% in sync with the audit trail in StockLedger.
+ * 1. For any product with initial quantity > 0 and 0 stock ledger records, creates an INITIAL entry.
+ * 2. For all products with entries in StockLedger, synchronizes Product.quantity to equal SUM(quantityChange).
+ */
+export async function syncProductQuantitiesWithLedger() {
+  try {
+    // 1. Ensure opening stock is tracked in StockLedger for any product that has quantity > 0 but no ledger entries
+    const productsWithoutLedger: any = await prisma.$queryRaw`
+      SELECT p.id, p.quantity, p."createdAt"
+      FROM "Product" p
+      WHERE p.quantity > 0
+        AND NOT EXISTS (
+          SELECT 1 FROM "StockLedger" sl WHERE sl."productId" = p.id
+        )
+    `;
+
+    for (const prod of productsWithoutLedger) {
+      const qty = Number(prod.quantity);
+      const dt = prod.createdAt ? new Date(prod.createdAt) : new Date('2020-01-01');
+      await prisma.stockLedger.create({
+        data: {
+          productId: prod.id,
+          date: dt,
+          type: 'INITIAL',
+          quantityChange: qty,
+          runningBalance: qty,
+          createdAt: dt,
+        }
+      });
+    }
+
+    // 2. Sync Product.quantity with the exact sum of StockLedger for all products with ledger entries
+    // This fixes any desynchronization (such as Bin Report showing -1 while StockLedger has 99)
+    await prisma.$executeRaw`
+      UPDATE "Product" p
+      SET quantity = COALESCE((
+        SELECT SUM(sl."quantityChange")
+        FROM "StockLedger" sl
+        WHERE sl."productId" = p.id
+      ), 0)
+      WHERE EXISTS (
+        SELECT 1 FROM "StockLedger" sl
+        WHERE sl."productId" = p.id
+      );
+    `;
+  } catch (err: any) {
+    console.error('[Inventory Reconcile] Error syncing product quantities with StockLedger:', err?.message || err);
+  }
+}
+
 // Helper to calculate WAC and FIFO for a product
 async function calculateValuationsForProduct(product: any, ledgers: any[]) {
   const productLedgers = ledgers.filter(l => l.productId === product.id);
+  const ledgerQty = productLedgers.reduce((sum, l) => sum + Number(l.quantityChange || 0), 0);
+  const effectiveQty = productLedgers.length > 0 ? ledgerQty : Number(product.quantity || 0);
   
   let wacQty = 0;
   let wacPrice = 0;
@@ -58,6 +112,7 @@ async function calculateValuationsForProduct(product: any, ledgers: any[]) {
   
   return {
     ...product,
+    quantity: effectiveQty,
     disabled: product.status === 'Inactive',
     wacPrice,
     wacValue: wacQty * wacPrice,
@@ -251,6 +306,9 @@ router.get('/stock-as-of-date', async (req: Request, res: Response) => {
 // GET Bin Report (Stock Balance)
 router.get('/bin-report', async (req: Request, res: Response) => {
   try {
+    // Proactively heal any desynchronization between Product.quantity and StockLedger
+    await syncProductQuantitiesWithLedger();
+
     const { search, warehouse, itemGroup, filter } = req.query;
 
     const whereClause: any = {};
@@ -282,12 +340,33 @@ router.get('/bin-report', async (req: Request, res: Response) => {
       orderBy: { name: 'asc' },
     });
 
+    // Also fetch live cumulative StockLedger sums for all these products to guarantee 100% audit consistency
+    const productIds = products.map((p) => p.id);
+    const ledgerMap = new Map<string, number>();
+
+    if (productIds.length > 0) {
+      const ledgerSums: any = await prisma.$queryRaw`
+        SELECT 
+          sl."productId", 
+          SUM(sl."quantityChange") AS "ledgerSum"
+        FROM "StockLedger" sl
+        WHERE sl."productId" IN (${Prisma.join(productIds)})
+        GROUP BY sl."productId"
+      `;
+      for (const row of ledgerSums) {
+        ledgerMap.set(row.productId, Number(row.ledgerSum) || 0);
+      }
+    }
+
     const parts = await prisma.partOf.findMany();
     const subParts = await prisma.subPartOf.findMany();
 
     const binReport = products.map((p, idx) => {
       const part = parts.length > 0 ? parts[idx % parts.length].name : 'Standard';
       const subPart = subParts.length > 0 ? subParts[idx % subParts.length].name : 'General';
+
+      // Always display the true cumulative stock ledger balance if ledger entries exist
+      const actualQuantity = ledgerMap.has(p.id) ? ledgerMap.get(p.id)! : (Number(p.quantity) || 0);
 
       return {
         id: p.id,
@@ -297,10 +376,10 @@ router.get('/bin-report', async (req: Request, res: Response) => {
         partOf: part,
         subPartOf: subPart,
         uom: p.unit?.name || 'Pcs',
-        actualQuantity: Number(p.quantity) || 0,
+        actualQuantity,
         warehouse: p.location || 'Main Warehouse',
         assignedTo: 'Plant Store',
-        tags: p.quantity <= p.min_stock ? 'LOW STOCK' : 'IN STOCK',
+        tags: actualQuantity <= p.min_stock ? 'LOW STOCK' : 'IN STOCK',
       };
     });
 
@@ -609,12 +688,52 @@ router.put('/:id', async (req: Request, res: Response) => {
       : (data.status ? data.status : undefined);
 
     const product = await prisma.$transaction(async (tx) => {
+      let finalQuantity: number | undefined = undefined;
+      if (data.quantity !== undefined && data.quantity !== null && data.quantity !== '') {
+        const newQty = parseInt(data.quantity);
+        finalQuantity = newQty;
+
+        const ledgerAgg: any = await tx.$queryRaw`
+          SELECT COALESCE(SUM("quantityChange"), 0) AS total_ledger_qty,
+                 COUNT(*)::INTEGER AS ledger_count
+          FROM "StockLedger"
+          WHERE "productId" = ${id}
+        `;
+        const ledgerCount = Number(ledgerAgg[0]?.ledger_count || 0);
+        const currentLedgerTotal = Number(ledgerAgg[0]?.total_ledger_qty || 0);
+
+        if (ledgerCount > 0) {
+          const diff = newQty - currentLedgerTotal;
+          if (diff !== 0) {
+            await tx.stockLedger.create({
+              data: {
+                productId: id,
+                date: new Date(),
+                type: 'ADJUSTMENT',
+                quantityChange: diff,
+                runningBalance: newQty,
+              }
+            });
+          }
+        } else if (newQty > 0) {
+          await tx.stockLedger.create({
+            data: {
+              productId: id,
+              date: new Date(),
+              type: 'INITIAL',
+              quantityChange: newQty,
+              runningBalance: newQty,
+            }
+          });
+        }
+      }
+
       const updated = await tx.product.update({
         where: { id },
         data: {
           sku: data.sku !== undefined ? data.sku.toString().trim() : undefined,
           name: data.name !== undefined ? data.name.toString().trim() : undefined,
-          quantity: data.quantity !== undefined && data.quantity !== null && data.quantity !== '' ? parseInt(data.quantity) : undefined,
+          quantity: finalQuantity,
           cost_price: data.cost_price !== undefined && data.cost_price !== null && data.cost_price !== '' ? parseFloat(data.cost_price) : undefined,
           selling_price: data.selling_price !== undefined && data.selling_price !== null && data.selling_price !== '' ? parseFloat(data.selling_price) : undefined,
           min_stock: data.min_stock !== undefined && data.min_stock !== null && data.min_stock !== '' ? parseInt(data.min_stock) : undefined,

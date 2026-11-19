@@ -403,8 +403,27 @@ router.post('/', async (req: Request, res: Response) => {
               .filter((i: any) => i.productId === item.productId)
               .reduce((sum: number, i: any) => sum + Number(i.quantity), 0);
 
-            if (!currentProduct || currentProduct.quantity < totalRequestedQty) {
-              throw new Error(`Insufficient current stock for "${currentProduct?.name || item.productId}". Available today: ${currentProduct?.quantity || 0}, requested: ${totalRequestedQty}`);
+            const ledgerSumRes: any = await tx.$queryRaw`
+              SELECT COALESCE(SUM("quantityChange"), 0) AS total_ledger_qty,
+                     COUNT(*)::INTEGER AS ledger_count
+              FROM "StockLedger"
+              WHERE "productId" = ${item.productId}
+            `;
+            const ledgerCount = Number(ledgerSumRes[0]?.ledger_count || 0);
+            const totalLedgerQty = Number(ledgerSumRes[0]?.total_ledger_qty || 0);
+            const effectiveStock = ledgerCount > 0 ? totalLedgerQty : (currentProduct?.quantity || 0);
+
+            // Keep currentProduct.quantity in sync if it diverged
+            if (currentProduct && ledgerCount > 0 && currentProduct.quantity !== totalLedgerQty) {
+              await tx.product.update({
+                where: { id: item.productId },
+                data: { quantity: totalLedgerQty }
+              });
+              currentProduct.quantity = totalLedgerQty;
+            }
+
+            if (!currentProduct || effectiveStock < totalRequestedQty) {
+              throw new Error(`Insufficient current stock for "${currentProduct?.name || item.productId}". Available today: ${effectiveStock}, requested: ${totalRequestedQty}`);
             }
 
             // 1. Strict Point-in-Time Check: Verify stock was actually available on the invoice date
@@ -585,12 +604,16 @@ router.post('/', async (req: Request, res: Response) => {
                 AND date > ${invoiceDate}::TIMESTAMP
           `;
 
-          // Update the cached quantity on the product
-          const newProductQuantity = product.quantity + quantityChange;
-          await tx.product.update({
-            where: { id: item.productId },
-            data: { quantity: newProductQuantity },
-          });
+          // Update the cached quantity on the product to exactly match StockLedger sum
+          await tx.$executeRaw`
+            UPDATE "Product"
+            SET quantity = COALESCE((
+              SELECT SUM(sl."quantityChange")
+              FROM "StockLedger" sl
+              WHERE sl."productId" = ${item.productId}
+            ), 0)
+            WHERE id = ${item.productId}
+          `;
         }
 
         // 4. Update Cash Ledger
@@ -786,16 +809,21 @@ router.put('/:id', async (req: Request, res: Response) => {
           const oldQty = Math.round(Number(oldItem.quantity));
           const revertQty = existingInvoice.type === 'PURCHASE' ? -oldQty : oldQty;
 
-          await tx.product.update({
-            where: { id: oldItem.productId },
-            data: { quantity: { increment: revertQty } }
-          });
-
           await tx.$queryRaw`
             UPDATE "StockLedger"
             SET "runningBalance" = "runningBalance" + ${revertQty}
             WHERE "productId" = ${oldItem.productId}
               AND date > ${existingInvoice.date}::TIMESTAMP
+          `;
+
+          await tx.$executeRaw`
+            UPDATE "Product"
+            SET quantity = COALESCE((
+              SELECT SUM(sl."quantityChange")
+              FROM "StockLedger" sl
+              WHERE sl."productId" = ${oldItem.productId}
+            ), 0)
+            WHERE id = ${oldItem.productId}
           `;
         }
 
@@ -1001,10 +1029,15 @@ router.put('/:id', async (req: Request, res: Response) => {
             AND date > ${invoiceDate}::TIMESTAMP
         `;
 
-        await tx.product.update({
-          where: { id: item.productId },
-          data: { quantity: { increment: quantityChange } }
-        });
+        await tx.$executeRaw`
+          UPDATE "Product"
+          SET quantity = COALESCE((
+            SELECT SUM(sl."quantityChange")
+            FROM "StockLedger" sl
+            WHERE sl."productId" = ${item.productId}
+          ), 0)
+          WHERE id = ${item.productId}
+        `;
       }
 
       // 6. APPLY NEW CASH LEDGER
@@ -1851,16 +1884,21 @@ router.post('/:id/cancel', async (req: Request, res: Response) => {
             const qty = Math.round(Number(item.quantity));
             const revertQty = -qty; // Purchase added stock, so cancel subtracts it
 
-            await tx.product.update({
-              where: { id: item.productId },
-              data: { quantity: { increment: revertQty } },
-            });
-
             await tx.$queryRaw`
               UPDATE "StockLedger"
               SET "runningBalance" = "runningBalance" + ${revertQty}
               WHERE "productId" = ${item.productId}
                 AND date > ${existingInvoice.date}::TIMESTAMP
+            `;
+
+            await tx.$executeRaw`
+              UPDATE "Product"
+              SET quantity = COALESCE((
+                SELECT SUM(sl."quantityChange")
+                FROM "StockLedger" sl
+                WHERE sl."productId" = ${item.productId}
+              ), 0)
+              WHERE id = ${item.productId}
             `;
           }
 
