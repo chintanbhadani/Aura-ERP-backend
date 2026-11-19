@@ -1760,22 +1760,62 @@ router.post('/:id/cancel', async (req: Request, res: Response) => {
 
     const isDraft = !existingInvoice.status || String(existingInvoice.status).trim().toLowerCase() === 'draft';
 
-    // 1. SALES INVOICE CANCELLATION RULE:
-    // Only cancel if sales invoice in draft status
+    // 1. SALES INVOICE CANCELLATION:
     if (existingInvoice.type === 'SALES') {
-      if (!isDraft) {
-        return res.status(400).json({
-          error: 'Cannot cancel Sales Invoice: Only draft sales invoices can be cancelled. Submitted sales invoices cannot be cancelled.'
-        });
-      }
+      const updated = await prisma.$transaction(async (tx) => {
+        if (!isDraft) {
+          // Revert stock from Product and StockLedger
+          for (const item of existingInvoice.items) {
+            if (!item.productId) continue;
+            const qty = Math.round(Number(item.quantity));
+            const revertQty = qty; // Sales deducted stock (-qty), so cancel adds it back (+qty)
 
-      const updated = await prisma.invoice.update({
-        where: { id },
-        data: { status: 'Cancelled' },
+            await tx.$queryRaw`
+              UPDATE "StockLedger"
+              SET "runningBalance" = "runningBalance" + ${revertQty}
+              WHERE "productId" = ${item.productId}
+                AND date > ${existingInvoice.date}::TIMESTAMP
+            `;
+
+            // Delete stock ledgers for this sales invoice
+            await tx.stockLedger.deleteMany({
+              where: { invoiceId: id }
+            });
+
+            await tx.$executeRaw`
+              UPDATE "Product"
+              SET quantity = COALESCE((
+                SELECT SUM(sl."quantityChange")
+                FROM "StockLedger" sl
+                WHERE sl."productId" = ${item.productId}
+              ), 0)
+              WHERE id = ${item.productId}
+            `;
+          }
+
+          // Revert CashLedger
+          const oldCashLedgers = await tx.cashLedger.findMany({ where: { invoiceId: id } });
+          for (const cl of oldCashLedgers) {
+            const revertCash = -Number(cl.amountChange);
+            await tx.$queryRaw`
+              UPDATE "CashLedger"
+              SET "runningBalance" = "runningBalance" + ${revertCash}
+              WHERE "paymentType" = ${cl.paymentType}::"PaymentType"
+                AND date > ${cl.date}::TIMESTAMP
+            `;
+          }
+
+          await tx.cashLedger.deleteMany({ where: { invoiceId: id } });
+        }
+
+        return tx.invoice.update({
+          where: { id },
+          data: { status: 'Cancelled' },
+        });
       });
 
       return res.json({
-        message: 'Draft sales invoice cancelled successfully.',
+        message: 'Sales invoice cancelled successfully. Stock has been safely restored. You can now amend or create a new invoice.',
         invoice: updated,
       });
     }

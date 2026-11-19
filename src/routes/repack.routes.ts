@@ -260,7 +260,8 @@ router.post('/', async (req: Request, res: Response) => {
       poAllocations,
       packagingCost = 0,
       date,
-      notes
+      notes,
+      status = 'Submitted'
     } = req.body;
 
     if (!sourceProductId || !targetProductId) {
@@ -279,6 +280,7 @@ router.post('/', async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'Source item and Target item cannot be the same product' });
     }
 
+    const isDraft = status === 'Draft';
     const repackDate = date ? new Date(date) : new Date();
     const repackNumber = await generateRepackNumber();
 
@@ -289,7 +291,7 @@ router.post('/', async (req: Request, res: Response) => {
         throw new Error('Source bulk product not found');
       }
 
-      if (sourceProd.quantity < srcQty) {
+      if (!isDraft && sourceProd.quantity < srcQty) {
         throw new Error(
           `Insufficient bulk stock for "${sourceProd.name}". Current available: ${sourceProd.quantity}, required: ${srcQty}`
         );
@@ -362,13 +364,18 @@ router.post('/', async (req: Request, res: Response) => {
           packagingCost: extraCost,
           calculatedCost: calculatedUnitCost,
           notes: notes || `Repacked ${srcQty} of ${sourceProd.name} from ${resolvedPoNumber || 'Bulk'} into ${tgtQty} of ${targetProd.name}`,
-          status: 'Completed'
+          status: isDraft ? 'Draft' : 'Submitted'
         },
         include: {
           sourceProduct: { include: { unit: true } },
           targetProduct: { include: { unit: true } }
         }
       });
+
+      // If Draft, do not execute stock movements yet
+      if (isDraft) {
+        return entry;
+      }
 
       // 5. Stock Ledger: Deduct Source Bulk Item (-srcQty)
       const srcCurrentBalanceRes: any = await tx.$queryRaw`
@@ -397,12 +404,11 @@ router.post('/', async (req: Request, res: Response) => {
           AND date > ${repackDate}::TIMESTAMP
       `;
 
-      await tx.product.update({
-        where: { id: sourceProductId },
-        data: {
-          quantity: { decrement: srcQty }
-        }
-      });
+      await tx.$executeRaw`
+        UPDATE "Product"
+        SET quantity = COALESCE((SELECT SUM("quantityChange") FROM "StockLedger" WHERE "productId" = ${sourceProductId}), 0)
+        WHERE id = ${sourceProductId}
+      `;
 
       // 6. Stock Ledger: Add Target Packed Item (+tgtQty)
       const tgtCurrentBalanceRes: any = await tx.$queryRaw`
@@ -431,13 +437,12 @@ router.post('/', async (req: Request, res: Response) => {
           AND date > ${repackDate}::TIMESTAMP
       `;
 
-      await tx.product.update({
-        where: { id: targetProductId },
-        data: {
-          quantity: { increment: tgtQty },
-          cost_price: calculatedUnitCost // Updates cost price so profit margin & sales pricing stay accurate!
-        }
-      });
+      await tx.$executeRaw`
+        UPDATE "Product"
+        SET quantity = COALESCE((SELECT SUM("quantityChange") FROM "StockLedger" WHERE "productId" = ${targetProductId}), 0),
+            cost_price = ${calculatedUnitCost}
+        WHERE id = ${targetProductId}
+      `;
 
       return entry;
     });
@@ -446,6 +451,232 @@ router.post('/', async (req: Request, res: Response) => {
   } catch (error: any) {
     console.error('Error creating repack entry:', error);
     res.status(500).json({ error: error.message || 'Failed to process repack' });
+  }
+});
+
+// GET single repack entry by ID
+router.get('/:id', async (req: Request, res: Response) => {
+  try {
+    await ensureRepackTable();
+    const { id } = req.params;
+    const entry = await prisma.repackEntry.findUnique({
+      where: { id },
+      include: {
+        sourceProduct: { include: { unit: true } },
+        targetProduct: { include: { unit: true } }
+      }
+    });
+
+    if (!entry) {
+      return res.status(404).json({ error: 'Repack entry not found' });
+    }
+
+    res.json(entry);
+  } catch (error: any) {
+    res.status(500).json({ error: error.message || 'Failed to fetch repack entry' });
+  }
+});
+
+// POST submit a draft repack entry
+router.post('/:id/submit', async (req: Request, res: Response) => {
+  try {
+    await ensureRepackTable();
+    const { id } = req.params;
+
+    const existing = await prisma.repackEntry.findUnique({ where: { id } });
+    if (!existing) return res.status(404).json({ error: 'Repack entry not found' });
+
+    if (existing.status === 'Submitted' || existing.status === 'Completed') {
+      return res.status(400).json({ error: 'Repack entry is already submitted' });
+    }
+    if (existing.status === 'Cancelled') {
+      return res.status(400).json({ error: 'Cannot submit a cancelled repack entry' });
+    }
+
+    const srcQty = Number(existing.sourceQuantity);
+    const tgtQty = Number(existing.targetQuantity);
+    const repackDate = new Date(existing.date);
+
+    const result = await prisma.$transaction(async (tx) => {
+      const sourceProd = await tx.product.findUnique({ where: { id: existing.sourceProductId } });
+      if (!sourceProd || sourceProd.quantity < srcQty) {
+        throw new Error(`Insufficient bulk stock for "${sourceProd?.name || existing.sourceProductId}". Available: ${sourceProd?.quantity || 0}, requested: ${srcQty}`);
+      }
+
+      // Deduct source bulk
+      const srcCurrentBalanceRes: any = await tx.$queryRaw`
+        SELECT COALESCE(SUM("quantityChange"), 0) AS balance_before
+        FROM "StockLedger"
+        WHERE "productId" = ${existing.sourceProductId}
+          AND date < ${repackDate}::TIMESTAMP
+      `;
+      const srcBalanceBefore = Number(srcCurrentBalanceRes[0]?.balance_before || 0);
+      const srcRunningBalance = srcBalanceBefore - srcQty;
+
+      await tx.stockLedger.create({
+        data: {
+          productId: existing.sourceProductId,
+          date: repackDate,
+          type: 'REPACK_OUT',
+          quantityChange: -srcQty,
+          runningBalance: srcRunningBalance
+        }
+      });
+
+      await tx.$queryRaw`
+        UPDATE "StockLedger"
+        SET "runningBalance" = "runningBalance" - ${srcQty}
+        WHERE "productId" = ${existing.sourceProductId}
+          AND date > ${repackDate}::TIMESTAMP
+      `;
+
+      await tx.$executeRaw`
+        UPDATE "Product"
+        SET quantity = COALESCE((SELECT SUM("quantityChange") FROM "StockLedger" WHERE "productId" = ${existing.sourceProductId}), 0)
+        WHERE id = ${existing.sourceProductId}
+      `;
+
+      // Add target packed item
+      const tgtCurrentBalanceRes: any = await tx.$queryRaw`
+        SELECT COALESCE(SUM("quantityChange"), 0) AS balance_before
+        FROM "StockLedger"
+        WHERE "productId" = ${existing.targetProductId}
+          AND date < ${repackDate}::TIMESTAMP
+      `;
+      const tgtBalanceBefore = Number(tgtCurrentBalanceRes[0]?.balance_before || 0);
+      const tgtRunningBalance = tgtBalanceBefore + tgtQty;
+
+      await tx.stockLedger.create({
+        data: {
+          productId: existing.targetProductId,
+          date: repackDate,
+          type: 'REPACK_IN',
+          quantityChange: tgtQty,
+          runningBalance: tgtRunningBalance
+        }
+      });
+
+      await tx.$queryRaw`
+        UPDATE "StockLedger"
+        SET "runningBalance" = "runningBalance" + ${tgtQty}
+        WHERE "productId" = ${existing.targetProductId}
+          AND date > ${repackDate}::TIMESTAMP
+      `;
+
+      await tx.$executeRaw`
+        UPDATE "Product"
+        SET quantity = COALESCE((SELECT SUM("quantityChange") FROM "StockLedger" WHERE "productId" = ${existing.targetProductId}), 0)
+        WHERE id = ${existing.targetProductId}
+      `;
+
+      return tx.repackEntry.update({
+        where: { id },
+        data: { status: 'Submitted' },
+        include: {
+          sourceProduct: { include: { unit: true } },
+          targetProduct: { include: { unit: true } }
+        }
+      });
+    });
+
+    res.json(result);
+  } catch (error: any) {
+    console.error('Error submitting repack entry:', error);
+    res.status(500).json({ error: error.message || 'Failed to submit repack entry' });
+  }
+});
+
+// POST cancel a repack entry
+router.post('/:id/cancel', async (req: Request, res: Response) => {
+  try {
+    await ensureRepackTable();
+    const { id } = req.params;
+
+    const entry = await prisma.repackEntry.findUnique({ where: { id } });
+    if (!entry) return res.status(404).json({ error: 'Repack entry not found' });
+
+    if (entry.status === 'Cancelled') {
+      return res.status(400).json({ error: 'Repack entry is already cancelled' });
+    }
+
+    const isSubmitted = entry.status === 'Submitted' || entry.status === 'Completed';
+
+    const result = await prisma.$transaction(async (tx) => {
+      if (isSubmitted) {
+        const srcQty = Number(entry.sourceQuantity);
+        const tgtQty = Number(entry.targetQuantity);
+
+        // Check if target product produced by this repack has already been consumed/sold
+        const targetProd = await tx.product.findUnique({ where: { id: entry.targetProductId } });
+        if (targetProd && targetProd.quantity < tgtQty) {
+          throw new Error(`Cannot cancel Repack: Produced items for "${targetProd.name}" have already been consumed or sold. Current stock is ${targetProd.quantity}, required to revert: ${tgtQty}`);
+        }
+
+        // Delete the corresponding repack ledger entries
+        await tx.$executeRaw`
+          DELETE FROM "StockLedger"
+          WHERE id IN (
+            SELECT id FROM "StockLedger"
+            WHERE "productId" = ${entry.sourceProductId}
+              AND type = 'REPACK_OUT'
+              AND "quantityChange" = -${srcQty}
+              AND date = ${entry.date}::TIMESTAMP
+            LIMIT 1
+          )
+        `;
+        await tx.$executeRaw`
+          DELETE FROM "StockLedger"
+          WHERE id IN (
+            SELECT id FROM "StockLedger"
+            WHERE "productId" = ${entry.targetProductId}
+              AND type = 'REPACK_IN'
+              AND "quantityChange" = ${tgtQty}
+              AND date = ${entry.date}::TIMESTAMP
+            LIMIT 1
+          )
+        `;
+
+        // Update future running balances
+        await tx.$executeRaw`
+          UPDATE "StockLedger"
+          SET "runningBalance" = "runningBalance" + ${srcQty}
+          WHERE "productId" = ${entry.sourceProductId}
+            AND date > ${entry.date}::TIMESTAMP
+        `;
+        await tx.$executeRaw`
+          UPDATE "StockLedger"
+          SET "runningBalance" = "runningBalance" - ${tgtQty}
+          WHERE "productId" = ${entry.targetProductId}
+            AND date > ${entry.date}::TIMESTAMP
+        `;
+
+        // Sync Product.quantity for both products to match true StockLedger sum
+        await tx.$executeRaw`
+          UPDATE "Product"
+          SET quantity = COALESCE((SELECT SUM("quantityChange") FROM "StockLedger" WHERE "productId" = ${entry.sourceProductId}), 0)
+          WHERE id = ${entry.sourceProductId}
+        `;
+        await tx.$executeRaw`
+          UPDATE "Product"
+          SET quantity = COALESCE((SELECT SUM("quantityChange") FROM "StockLedger" WHERE "productId" = ${entry.targetProductId}), 0)
+          WHERE id = ${entry.targetProductId}
+        `;
+      }
+
+      return tx.repackEntry.update({
+        where: { id },
+        data: { status: 'Cancelled' },
+        include: {
+          sourceProduct: { include: { unit: true } },
+          targetProduct: { include: { unit: true } }
+        }
+      });
+    });
+
+    res.json({ message: 'Repack entry cancelled successfully. Stock has been restored.', entry: result });
+  } catch (error: any) {
+    console.error('Error cancelling repack entry:', error);
+    res.status(500).json({ error: error.message || 'Failed to cancel repack entry' });
   }
 });
 
