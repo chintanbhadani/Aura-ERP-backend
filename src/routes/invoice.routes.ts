@@ -15,6 +15,7 @@ async function ensureInvoiceColumns() {
     await prisma.$executeRawUnsafe(`ALTER TABLE "Invoice" ADD COLUMN IF NOT EXISTS "shippingCharge" DECIMAL(10, 2) DEFAULT 0;`);
     await prisma.$executeRawUnsafe(`ALTER TABLE "Invoice" ADD COLUMN IF NOT EXISTS "laborCost" DECIMAL(10, 2) DEFAULT 0;`);
     await prisma.$executeRawUnsafe(`ALTER TABLE "Invoice" ADD COLUMN IF NOT EXISTS "status" TEXT DEFAULT 'Draft';`);
+    await prisma.$executeRawUnsafe(`ALTER TABLE "Invoice" ADD COLUMN IF NOT EXISTS "amendedFrom" TEXT;`);
     await prisma.$executeRawUnsafe(`UPDATE "Invoice" SET "status" = 'Draft' WHERE "status" IS NULL;`);
     invoiceColumnsChecked = true;
   } catch (err) {
@@ -23,32 +24,32 @@ async function ensureInvoiceColumns() {
 }
 ensureInvoiceColumns();
 
-// Utility to generate invoice number
+// Utility to generate invoice number (ignoring amended suffixes)
 const generateInvoiceNumber = async (type: InvoiceType) => {
   const year = new Date().getFullYear();
   const typeChar = type === 'PURCHASE' ? 'P' : 'S';
   const prefix = `INV-${year}-${typeChar}`;
 
-  const lastInvoice = await prisma.invoice.findFirst({
+  const invoices = await prisma.invoice.findMany({
     where: {
       invoiceNumber: {
         startsWith: prefix,
       },
     },
-    orderBy: {
-      invoiceNumber: 'desc',
-    },
+    select: { invoiceNumber: true },
   });
 
-  if (!lastInvoice) {
-    return `${prefix}0001`;
+  let maxNum = 0;
+  for (const inv of invoices) {
+    const sub = inv.invoiceNumber.replace(prefix, '');
+    if (/^\d+$/.test(sub)) {
+      const n = parseInt(sub, 10);
+      if (!isNaN(n) && n > maxNum) maxNum = n;
+    }
   }
 
-  // Extract the number part
-  const lastNumberStr = lastInvoice.invoiceNumber.replace(prefix, '');
-  const nextNumber = parseInt(lastNumberStr, 10) + 1;
+  const nextNumber = maxNum + 1;
   const paddedNumber = nextNumber.toString().padStart(4, '0');
-
   return `${prefix}${paddedNumber}`;
 };
 
@@ -126,12 +127,13 @@ router.get('/available-batches/:productId', async (req: Request, res: Response) 
       },
     });
 
-    // 2. Fetch all sales items linked to any purchase item of this product
+    // 2. Fetch all active (non-cancelled) sales items linked to any purchase item of this product
     const salesItems = await prisma.invoiceItem.findMany({
       where: {
         productId,
         invoice: {
           type: 'SALES',
+          status: { not: 'Cancelled' },
         },
         OR: [
           { purchaseItemId: { not: null } },
@@ -300,9 +302,29 @@ router.get('/:id', async (req: Request, res: Response) => {
       },
     });
     if (!invoice) return res.status(404).json({ error: 'Invoice not found' });
+
+    // Look up if another invoice was created amending this one
+    const amendedRecord = await prisma.invoice.findFirst({
+      where: {
+        amendedFrom: invoice.invoiceNumber,
+      },
+      select: { id: true, invoiceNumber: true, status: true, type: true },
+    });
+
+    // Look up original invoice if this is an amended one
+    let originalRecord: any = null;
+    if ((invoice as any).amendedFrom) {
+      originalRecord = await prisma.invoice.findFirst({
+        where: { invoiceNumber: (invoice as any).amendedFrom },
+        select: { id: true, invoiceNumber: true, status: true, type: true },
+      });
+    }
+
     const formatted = {
       ...invoice,
       status: invoice.status || 'Draft',
+      amendedAs: amendedRecord || null,
+      amendedFromId: originalRecord?.id || null,
       client: invoice.customer ? { ...invoice.customer, companyName: invoice.customer.name } : null,
     };
     res.json(formatted);
@@ -333,18 +355,23 @@ router.post('/', async (req: Request, res: Response) => {
       attachments,
       shippingCharge,
       laborCost,
-      status
+      status,
+      invoiceNumber: requestedInvoiceNumber,
+      amendedFrom,
     } = req.body;
 
     if (!type || !items || !items.length) {
       return res.status(400).json({ error: 'Type and items are required' });
     }
 
-    if (type === 'SALES' && !customerId) {
+    const effectiveCustomerId = customerId || req.body.clientId;
+    const effectiveSupplierId = supplierId;
+
+    if (type === 'SALES' && !effectiveCustomerId) {
       return res.status(400).json({ error: 'Customer is required for sales invoice' });
     }
 
-    if (type === 'PURCHASE' && !supplierId) {
+    if (type === 'PURCHASE' && !effectiveSupplierId) {
       return res.status(400).json({ error: 'Supplier is required for purchase invoice' });
     }
 
@@ -356,7 +383,16 @@ router.post('/', async (req: Request, res: Response) => {
     );
     const totalAmount = itemsTotal + numShippingCharge + numLaborCost;
 
-    const invoiceNumber = await generateInvoiceNumber(type as InvoiceType);
+    let invoiceNumber: string;
+    if (requestedInvoiceNumber && String(requestedInvoiceNumber).trim()) {
+      invoiceNumber = String(requestedInvoiceNumber).trim().toUpperCase();
+      const existing = await prisma.invoice.findUnique({ where: { invoiceNumber } });
+      if (existing) {
+        return res.status(400).json({ error: `Invoice number "${invoiceNumber}" already exists.` });
+      }
+    } else {
+      invoiceNumber = await generateInvoiceNumber(type as InvoiceType);
+    }
 
     const invoiceDate = new Date(date || Date.now());
     const isDraft = !status || String(status).trim().toLowerCase() === 'draft';
@@ -524,6 +560,7 @@ router.post('/', async (req: Request, res: Response) => {
       const invoice = await tx.invoice.create({
         data: {
           invoiceNumber,
+          amendedFrom: amendedFrom ? String(amendedFrom).trim().toUpperCase() : null,
           type,
           date: invoiceDate,
           dueDate: dueDate ? new Date(dueDate) : null,
@@ -532,8 +569,8 @@ router.post('/', async (req: Request, res: Response) => {
           totalAmount,
           shippingCharge: numShippingCharge,
           laborCost: numLaborCost,
-          customerId: type === 'SALES' ? customerId : null,
-          supplierId: type === 'PURCHASE' ? supplierId : null,
+          customerId: type === 'SALES' ? effectiveCustomerId : null,
+          supplierId: type === 'PURCHASE' ? effectiveSupplierId : null,
           paymentType: paymentType || 'CASH',
           cashAmount: finalCashAmount,
           bankAmount: finalBankAmount,
@@ -1764,24 +1801,45 @@ router.post('/:id/cancel', async (req: Request, res: Response) => {
     if (existingInvoice.type === 'SALES') {
       const updated = await prisma.$transaction(async (tx) => {
         if (!isDraft) {
-          // Revert stock from Product and StockLedger
+          const cancelDate = new Date();
+
+          // Settle stock and maintain complete StockLedger audit trail
           for (const item of existingInvoice.items) {
             if (!item.productId) continue;
             const qty = Math.round(Number(item.quantity));
             const revertQty = qty; // Sales deducted stock (-qty), so cancel adds it back (+qty)
 
+            // Determine running balance before cancellation entry
+            const currentBalanceResult: any = await tx.$queryRaw`
+              SELECT COALESCE(SUM("quantityChange"), 0) AS balance_before
+              FROM "StockLedger"
+              WHERE "productId" = ${item.productId}
+                AND date < ${cancelDate}::TIMESTAMP
+            `;
+            const balanceBefore = currentBalanceResult[0]?.balance_before ? Number(currentBalanceResult[0].balance_before) : 0;
+            const newRunningBalance = balanceBefore + revertQty;
+
+            // Record cancellation entry in StockLedger to plus the stock and maintain audit history
+            await tx.stockLedger.create({
+              data: {
+                productId: item.productId,
+                date: cancelDate,
+                type: 'SALES_CANCEL',
+                quantityChange: revertQty,
+                runningBalance: newRunningBalance,
+                invoiceId: id,
+              }
+            });
+
+            // Forward update running balances for any later backdated entries
             await tx.$queryRaw`
               UPDATE "StockLedger"
               SET "runningBalance" = "runningBalance" + ${revertQty}
               WHERE "productId" = ${item.productId}
-                AND date > ${existingInvoice.date}::TIMESTAMP
+                AND date > ${cancelDate}::TIMESTAMP
             `;
 
-            // Delete stock ledgers for this sales invoice
-            await tx.stockLedger.deleteMany({
-              where: { invoiceId: id }
-            });
-
+            // Keep Product.quantity 100% synchronized with the StockLedger audit trail
             await tx.$executeRaw`
               UPDATE "Product"
               SET quantity = COALESCE((
@@ -1918,19 +1976,45 @@ router.post('/:id/cancel', async (req: Request, res: Response) => {
       // Execute cancellation in transaction
       const updated = await prisma.$transaction(async (tx) => {
         if (!isDraft) {
-          // Revert stock from Product and StockLedger
+          const cancelDate = new Date();
+
+          // Settle stock and maintain complete StockLedger audit trail
           for (const item of existingInvoice.items) {
             if (!item.productId) continue;
             const qty = Math.round(Number(item.quantity));
-            const revertQty = -qty; // Purchase added stock, so cancel subtracts it
+            const revertQty = -qty; // Purchase added stock (+qty), so cancel subtracts it (-qty)
 
+            // Determine running balance before cancellation entry
+            const currentBalanceResult: any = await tx.$queryRaw`
+              SELECT COALESCE(SUM("quantityChange"), 0) AS balance_before
+              FROM "StockLedger"
+              WHERE "productId" = ${item.productId}
+                AND date < ${cancelDate}::TIMESTAMP
+            `;
+            const balanceBefore = currentBalanceResult[0]?.balance_before ? Number(currentBalanceResult[0].balance_before) : 0;
+            const newRunningBalance = balanceBefore + revertQty;
+
+            // Record cancellation entry in StockLedger to deduct stock and maintain audit history
+            await tx.stockLedger.create({
+              data: {
+                productId: item.productId,
+                date: cancelDate,
+                type: 'PURCHASE_CANCEL',
+                quantityChange: revertQty,
+                runningBalance: newRunningBalance,
+                invoiceId: id,
+              }
+            });
+
+            // Forward update running balances for any later backdated entries
             await tx.$queryRaw`
               UPDATE "StockLedger"
               SET "runningBalance" = "runningBalance" + ${revertQty}
               WHERE "productId" = ${item.productId}
-                AND date > ${existingInvoice.date}::TIMESTAMP
+                AND date > ${cancelDate}::TIMESTAMP
             `;
 
+            // Keep Product.quantity 100% synchronized with the StockLedger audit trail
             await tx.$executeRaw`
               UPDATE "Product"
               SET quantity = COALESCE((
@@ -1954,8 +2038,7 @@ router.post('/:id/cancel', async (req: Request, res: Response) => {
             `;
           }
 
-          // Delete stockLedgers and cashLedgers for this purchase invoice
-          await tx.stockLedger.deleteMany({ where: { invoiceId: id } });
+          // Delete cashLedgers for this purchase invoice
           await tx.cashLedger.deleteMany({ where: { invoiceId: id } });
         }
 

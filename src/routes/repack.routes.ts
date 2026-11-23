@@ -31,33 +31,36 @@ async function ensureRepackTable() {
     await prisma.$executeRawUnsafe(`ALTER TABLE "RepackEntry" ADD COLUMN IF NOT EXISTS "purchaseItemId" TEXT`);
     await prisma.$executeRawUnsafe(`ALTER TABLE "RepackEntry" ADD COLUMN IF NOT EXISTS "purchaseInvoiceNo" TEXT`);
     await prisma.$executeRawUnsafe(`ALTER TABLE "RepackEntry" ADD COLUMN IF NOT EXISTS "poAllocations" JSONB`);
+    await prisma.$executeRawUnsafe(`ALTER TABLE "RepackEntry" ADD COLUMN IF NOT EXISTS "amendedFrom" TEXT`);
     tableEnsured = true;
   } catch (err) {
     console.error('Error ensuring RepackEntry table:', err);
   }
 }
 
-// Helper to generate next repack number e.g. RPK-2026-0001
+// Helper to generate next repack number e.g. RPK-2026-0001 (ignoring amended suffixes)
 async function generateRepackNumber(): Promise<string> {
   await ensureRepackTable();
   const year = new Date().getFullYear();
   const prefix = `RPK-${year}-`;
 
-  const lastEntry = await prisma.repackEntry.findFirst({
+  const entries = await prisma.repackEntry.findMany({
     where: {
       repackNumber: { startsWith: prefix }
     },
-    orderBy: {
-      repackNumber: 'desc'
-    }
+    select: { repackNumber: true }
   });
 
-  if (!lastEntry) {
-    return `${prefix}0001`;
+  let maxNum = 0;
+  for (const ent of entries) {
+    const sub = ent.repackNumber.replace(prefix, '');
+    if (/^\d+$/.test(sub)) {
+      const n = parseInt(sub, 10);
+      if (!isNaN(n) && n > maxNum) maxNum = n;
+    }
   }
 
-  const lastNumStr = lastEntry.repackNumber.replace(prefix, '');
-  const nextNum = (parseInt(lastNumStr, 10) || 0) + 1;
+  const nextNum = maxNum + 1;
   return `${prefix}${nextNum.toString().padStart(4, '0')}`;
 }
 
@@ -240,7 +243,29 @@ router.get('/:id', async (req: Request, res: Response) => {
     });
 
     if (!repack) return res.status(404).json({ error: 'Repack entry not found' });
-    res.json(repack);
+
+    // Look up if another repack entry was created amending this one
+    const amendedRecord = await prisma.repackEntry.findFirst({
+      where: {
+        amendedFrom: repack.repackNumber,
+      },
+      select: { id: true, repackNumber: true, status: true },
+    });
+
+    // Look up original repack if this is an amended one
+    let originalRecord: any = null;
+    if ((repack as any).amendedFrom) {
+      originalRecord = await prisma.repackEntry.findFirst({
+        where: { repackNumber: (repack as any).amendedFrom },
+        select: { id: true, repackNumber: true, status: true },
+      });
+    }
+
+    res.json({
+      ...repack,
+      amendedAs: amendedRecord || null,
+      amendedFromId: originalRecord?.id || null,
+    });
   } catch (error: any) {
     res.status(500).json({ error: error.message || 'Failed to fetch repack entry' });
   }
@@ -282,7 +307,18 @@ router.post('/', async (req: Request, res: Response) => {
 
     const isDraft = status === 'Draft';
     const repackDate = date ? new Date(date) : new Date();
-    const repackNumber = await generateRepackNumber();
+
+    const { repackNumber: requestedRepackNumber, amendedFrom } = req.body;
+    let repackNumber: string;
+    if (requestedRepackNumber && String(requestedRepackNumber).trim()) {
+      repackNumber = String(requestedRepackNumber).trim().toUpperCase();
+      const existing = await prisma.repackEntry.findUnique({ where: { repackNumber } });
+      if (existing) {
+        return res.status(400).json({ error: `Repack number "${repackNumber}" already exists.` });
+      }
+    } else {
+      repackNumber = await generateRepackNumber();
+    }
 
     const result = await prisma.$transaction(async (tx) => {
       // 1. Fetch Source and Target Products
@@ -353,6 +389,7 @@ router.post('/', async (req: Request, res: Response) => {
       const entry = await tx.repackEntry.create({
         data: {
           repackNumber,
+          amendedFrom: amendedFrom ? String(amendedFrom).trim().toUpperCase() : null,
           date: repackDate,
           sourceProductId,
           sourceQuantity: srcQty,
@@ -454,26 +491,58 @@ router.post('/', async (req: Request, res: Response) => {
   }
 });
 
-// GET single repack entry by ID
-router.get('/:id', async (req: Request, res: Response) => {
+// PUT update a draft repack entry by ID
+router.put('/:id', async (req: Request, res: Response) => {
   try {
     await ensureRepackTable();
     const { id } = req.params;
-    const entry = await prisma.repackEntry.findUnique({
-      where: { id },
-      include: {
-        sourceProduct: { include: { unit: true } },
-        targetProduct: { include: { unit: true } }
-      }
-    });
+    const existing = await prisma.repackEntry.findUnique({ where: { id } });
 
-    if (!entry) {
+    if (!existing) {
       return res.status(404).json({ error: 'Repack entry not found' });
     }
 
-    res.json(entry);
+    if (existing.status !== 'Draft') {
+      return res.status(400).json({ error: `Cannot edit repack with status '${existing.status}'. Only Draft repacks can be edited.` });
+    }
+
+    const {
+      sourceProductId,
+      sourceQuantity,
+      targetProductId,
+      targetQuantity,
+      packagingCost,
+      purchaseItemId,
+      purchaseInvoiceNo,
+      poAllocations,
+      date,
+      notes,
+    } = req.body;
+
+    const updated = await prisma.repackEntry.update({
+      where: { id },
+      data: {
+        sourceProductId: sourceProductId ?? existing.sourceProductId,
+        sourceQuantity: sourceQuantity !== undefined ? Number(sourceQuantity) : existing.sourceQuantity,
+        targetProductId: targetProductId ?? existing.targetProductId,
+        targetQuantity: targetQuantity !== undefined ? Number(targetQuantity) : existing.targetQuantity,
+        packagingCost: packagingCost !== undefined ? Number(packagingCost) : existing.packagingCost,
+        purchaseItemId: purchaseItemId !== undefined ? purchaseItemId : existing.purchaseItemId,
+        purchaseInvoiceNo: purchaseInvoiceNo !== undefined ? purchaseInvoiceNo : existing.purchaseInvoiceNo,
+        poAllocations: poAllocations !== undefined ? poAllocations : existing.poAllocations,
+        date: date ? new Date(date) : existing.date,
+        notes: notes !== undefined ? notes : existing.notes,
+      },
+      include: {
+        sourceProduct: { include: { unit: true, category: true } },
+        targetProduct: { include: { unit: true, category: true } }
+      }
+    });
+
+    res.json(updated);
   } catch (error: any) {
-    res.status(500).json({ error: error.message || 'Failed to fetch repack entry' });
+    console.error('Error updating draft repack:', error);
+    res.status(500).json({ error: error.message || 'Failed to update draft repack' });
   }
 });
 
