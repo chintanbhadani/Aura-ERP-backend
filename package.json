@@ -14,6 +14,7 @@
     "db:clear": "node scripts/clear-test-data.js",
     "db:clear:all": "node scripts/clear-test-data.js --all",
     "db:wipe": "node scripts/clear-test-data.js --wipe-all",
+    "db:seed:company": "node scripts/seed-company.js",
     "bot:lockdown": "node scripts/telegram-lockdown-bot.js",
     "lockdown:on": "node -e \"const fs=require('fs'); fs.writeFileSync('maintenance.flag', JSON.stringify({lockedAt:new Date().toISOString(),by:'CLI'})); console.log('🔴 Maintenance Flag Created');\"",
     "lockdown:off": "node -e \"const fs=require('fs'); if(fs.existsSync('maintenance.flag')) fs.unlinkSync('maintenance.flag'); console.log('🟢 Maintenance Flag Removed');\"",

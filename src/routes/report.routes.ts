@@ -194,9 +194,12 @@ router.get('/cash-book', async (req: Request, res: Response) => {
     const initialBank = config ? Number(config.initialOpeningBank) : 0;
     const initialAirtel = config ? Number(config.initialOpeningAirtel) : 0;
 
-    // 2. Fetch all transactions chronologically
+    // 2. Fetch all transactions chronologically (excluding Cancelled & Draft invoices)
     const [invoices, expenses, payments] = await Promise.all([
       prisma.invoice.findMany({
+        where: {
+          status: { notIn: ['Cancelled', 'Draft'] }
+        },
         orderBy: { date: 'asc' },
         include: {
           customer: { select: { id: true, name: true, contact: true } },
@@ -212,6 +215,16 @@ router.get('/cash-book', async (req: Request, res: Response) => {
         orderBy: { date: 'asc' }
       }),
       prisma.payment.findMany({
+        where: {
+          OR: [
+            { invoiceId: null },
+            {
+              invoice: {
+                status: { notIn: ['Cancelled', 'Draft'] }
+              }
+            }
+          ]
+        },
         orderBy: { date: 'asc' },
         include: {
           customer: { select: { id: true, name: true } },
@@ -504,9 +517,12 @@ router.get('/sales-summary', async (req: Request, res: Response) => {
   try {
     const { startDate, endDate, search, customerId, supplierId, productId } = req.query;
 
-    // 1. Fetch all purchase invoices to map PO -> Supplier
+    // 1. Fetch all purchase invoices to map PO -> Supplier (excluding Cancelled & Draft)
     const purchaseInvoices = await prisma.invoice.findMany({
-      where: { type: 'PURCHASE' },
+      where: {
+        type: 'PURCHASE',
+        status: { notIn: ['Cancelled', 'Draft'] }
+      },
       include: {
         supplier: true,
         items: true,
@@ -531,9 +547,10 @@ router.get('/sales-summary', async (req: Request, res: Response) => {
       }
     }
 
-    // 2. Fetch sales invoices
+    // 2. Fetch sales invoices (excluding Cancelled & Draft)
     const whereClause: any = {
       type: 'SALES',
+      status: { notIn: ['Cancelled', 'Draft'] }
     };
 
     if (customerId) {
@@ -731,7 +748,10 @@ router.get('/party-ledger', async (req: Request, res: Response) => {
       where: search ? { name: { contains: search as string, mode: 'insensitive' } } : {},
       include: {
         invoices: {
-          where: { type: 'SALES' },
+          where: {
+            type: 'SALES',
+            status: { notIn: ['Cancelled', 'Draft'] }
+          },
           select: {
             id: true,
             invoiceNumber: true,
@@ -744,6 +764,16 @@ router.get('/party-ledger', async (req: Request, res: Response) => {
           }
         },
         payments: {
+          where: {
+            OR: [
+              { invoiceId: null },
+              {
+                invoice: {
+                  status: { notIn: ['Cancelled', 'Draft'] }
+                }
+              }
+            ]
+          },
           select: {
             id: true,
             amount: true,
@@ -761,7 +791,10 @@ router.get('/party-ledger', async (req: Request, res: Response) => {
       where: search ? { name: { contains: search as string, mode: 'insensitive' } } : {},
       include: {
         invoices: {
-          where: { type: 'PURCHASE' },
+          where: {
+            type: 'PURCHASE',
+            status: { notIn: ['Cancelled', 'Draft'] }
+          },
           select: {
             id: true,
             invoiceNumber: true,
@@ -774,6 +807,16 @@ router.get('/party-ledger', async (req: Request, res: Response) => {
           }
         },
         payments: {
+          where: {
+            OR: [
+              { invoiceId: null },
+              {
+                invoice: {
+                  status: { notIn: ['Cancelled', 'Draft'] }
+                }
+              }
+            ]
+          },
           select: {
             id: true,
             amount: true,

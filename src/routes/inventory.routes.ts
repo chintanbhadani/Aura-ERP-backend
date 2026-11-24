@@ -73,7 +73,7 @@ async function calculateValuationsForProduct(product: any, ledgers: any[]) {
   let fifoQueue: {qty: number, price: number}[] = [];
 
   for (const l of productLedgers) {
-    if (l.type === 'PURCHASE' && l.invoice) {
+    if (l.type === 'PURCHASE' && l.invoice && l.invoice.status !== 'Cancelled' && l.invoice.status !== 'Draft') {
       const item = l.invoice.items.find((i: any) => i.productId === product.id);
       if (item) {
         const qty = Number(item.quantity);
@@ -210,7 +210,7 @@ router.get('/stock-as-of-date', async (req: Request, res: Response) => {
             SELECT inv.date AS dt 
             FROM "InvoiceItem" ii
             JOIN "Invoice" inv ON inv.id = ii."invoiceId"
-            WHERE ii."productId" = p.id AND inv.type = 'PURCHASE' AND inv.date > ${endOfDay}::TIMESTAMP
+            WHERE ii."productId" = p.id AND inv.type = 'PURCHASE' AND inv.status NOT IN ('Cancelled', 'Draft') AND inv.date > ${endOfDay}::TIMESTAMP
           ) d
         ) AS "nextFutureStockDate",
         -- Earliest stock arrival date ever
@@ -223,7 +223,7 @@ router.get('/stock-as-of-date', async (req: Request, res: Response) => {
             SELECT inv.date AS dt 
             FROM "InvoiceItem" ii
             JOIN "Invoice" inv ON inv.id = ii."invoiceId"
-            WHERE ii."productId" = p.id AND inv.type = 'PURCHASE'
+            WHERE ii."productId" = p.id AND inv.type = 'PURCHASE' AND inv.status NOT IN ('Cancelled', 'Draft')
           ) d
         ) AS "earliestStockDate",
         -- Total inward transactions count ever
@@ -236,7 +236,7 @@ router.get('/stock-as-of-date', async (req: Request, res: Response) => {
             SELECT ii.id 
             FROM "InvoiceItem" ii
             JOIN "Invoice" inv ON inv.id = ii."invoiceId"
-            WHERE ii."productId" = p.id AND inv.type = 'PURCHASE'
+            WHERE ii."productId" = p.id AND inv.type = 'PURCHASE' AND inv.status NOT IN ('Cancelled', 'Draft')
           ) t
         ) AS "totalInwardCount"
       FROM "Product" p

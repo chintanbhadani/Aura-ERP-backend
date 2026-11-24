@@ -16,6 +16,7 @@ async function ensureInvoiceColumns() {
     await prisma.$executeRawUnsafe(`ALTER TABLE "Invoice" ADD COLUMN IF NOT EXISTS "laborCost" DECIMAL(10, 2) DEFAULT 0;`);
     await prisma.$executeRawUnsafe(`ALTER TABLE "Invoice" ADD COLUMN IF NOT EXISTS "status" TEXT DEFAULT 'Draft';`);
     await prisma.$executeRawUnsafe(`ALTER TABLE "Invoice" ADD COLUMN IF NOT EXISTS "amendedFrom" TEXT;`);
+    await prisma.$executeRawUnsafe(`ALTER TABLE "Invoice" ADD COLUMN IF NOT EXISTS "companyId" TEXT;`);
     await prisma.$executeRawUnsafe(`UPDATE "Invoice" SET "status" = 'Draft' WHERE "status" IS NULL;`);
     invoiceColumnsChecked = true;
   } catch (err) {
@@ -69,6 +70,7 @@ router.get('/', async (req: Request, res: Response) => {
       include: {
         customer: true,
         supplier: true,
+        company: true,
         items: {
           include: {
             product: true,
@@ -105,12 +107,13 @@ router.get('/available-batches/:productId', async (req: Request, res: Response) 
       return res.status(404).json({ error: 'Product not found' });
     }
 
-    // 1. Fetch all purchase items for this product
+    // 1. Fetch all purchase items for this product (excluding Cancelled & Draft)
     const purchaseItems = await prisma.invoiceItem.findMany({
       where: {
         productId,
         invoice: {
           type: 'PURCHASE',
+          status: { notIn: ['Cancelled', 'Draft'] },
         },
       },
       include: {
@@ -127,13 +130,13 @@ router.get('/available-batches/:productId', async (req: Request, res: Response) 
       },
     });
 
-    // 2. Fetch all active (non-cancelled) sales items linked to any purchase item of this product
+    // 2. Fetch all active (non-cancelled, non-draft) sales items linked to any purchase item of this product
     const salesItems = await prisma.invoiceItem.findMany({
       where: {
         productId,
         invoice: {
           type: 'SALES',
-          status: { not: 'Cancelled' },
+          status: { notIn: ['Cancelled', 'Draft'] },
         },
         OR: [
           { purchaseItemId: { not: null } },
@@ -294,6 +297,7 @@ router.get('/:id', async (req: Request, res: Response) => {
       include: {
         customer: true,
         supplier: true,
+        company: true,
         items: {
           include: {
             product: true,
@@ -345,6 +349,7 @@ router.post('/', async (req: Request, res: Response) => {
       paymentTerms, 
       customerId, 
       supplierId, 
+      companyId,
       items, 
       paymentType, 
       cashAmount, 
@@ -373,6 +378,19 @@ router.post('/', async (req: Request, res: Response) => {
 
     if (type === 'PURCHASE' && !effectiveSupplierId) {
       return res.status(400).json({ error: 'Supplier is required for purchase invoice' });
+    }
+
+    let effectiveCompanyId = companyId;
+    if (!effectiveCompanyId) {
+      const defaultCompany = await prisma.company.findFirst({
+        where: { OR: [{ isDefault: true }, { status: 'Active' }] },
+        orderBy: { isDefault: 'desc' }
+      });
+      if (defaultCompany) {
+        effectiveCompanyId = defaultCompany.id;
+      } else {
+        return res.status(400).json({ error: 'Company is required' });
+      }
     }
 
     const numShippingCharge = Number(shippingCharge || 0);
@@ -571,6 +589,7 @@ router.post('/', async (req: Request, res: Response) => {
           laborCost: numLaborCost,
           customerId: type === 'SALES' ? effectiveCustomerId : null,
           supplierId: type === 'PURCHASE' ? effectiveSupplierId : null,
+          companyId: effectiveCompanyId || null,
           paymentType: paymentType || 'CASH',
           cashAmount: finalCashAmount,
           bankAmount: finalBankAmount,
@@ -594,6 +613,7 @@ router.post('/', async (req: Request, res: Response) => {
         },
         include: {
           items: true,
+          company: true,
         },
       });
 
@@ -771,6 +791,7 @@ router.put('/:id', async (req: Request, res: Response) => {
       paymentTerms,
       customerId,
       supplierId,
+      companyId,
       items,
       paymentType,
       cashAmount,
@@ -1004,6 +1025,7 @@ router.put('/:id', async (req: Request, res: Response) => {
           laborCost: numLaborCost,
           customerId: type === 'SALES' ? effectiveCustomerId : null,
           supplierId: type === 'PURCHASE' ? effectiveSupplierId : null,
+          companyId: companyId !== undefined ? (companyId || null) : undefined,
           paymentType: paymentType || 'CASH',
           cashAmount: finalCashAmount,
           bankAmount: finalBankAmount,
@@ -1027,6 +1049,7 @@ router.put('/:id', async (req: Request, res: Response) => {
         },
         include: {
           items: true,
+          company: true,
         },
       });
 
@@ -1864,6 +1887,7 @@ router.post('/:id/cancel', async (req: Request, res: Response) => {
           }
 
           await tx.cashLedger.deleteMany({ where: { invoiceId: id } });
+          await tx.payment.deleteMany({ where: { invoiceId: id } });
         }
 
         return tx.invoice.update({
@@ -2040,6 +2064,7 @@ router.post('/:id/cancel', async (req: Request, res: Response) => {
 
           // Delete cashLedgers for this purchase invoice
           await tx.cashLedger.deleteMany({ where: { invoiceId: id } });
+          await tx.payment.deleteMany({ where: { invoiceId: id } });
         }
 
         return tx.invoice.update({

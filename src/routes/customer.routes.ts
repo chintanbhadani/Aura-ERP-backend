@@ -76,11 +76,12 @@ router.get('/:id/ledger', async (req: Request, res: Response) => {
       return res.status(404).json({ error: 'Customer not found' });
     }
 
-    // 1. Fetch all SALES invoices for this customer
+    // 1. Fetch all SALES invoices for this customer (excluding Cancelled & Draft)
     const invoices = await prisma.invoice.findMany({
       where: {
         customerId: id,
         type: 'SALES',
+        status: { notIn: ['Cancelled', 'Draft'] },
       },
       include: {
         items: {
@@ -95,9 +96,19 @@ router.get('/:id/ledger', async (req: Request, res: Response) => {
       orderBy: { date: 'asc' },
     });
 
-    // 2. Fetch all payments linked to this customer
+    // 2. Fetch all payments linked to this customer (excluding those linked to cancelled invoices)
     const payments = await prisma.payment.findMany({
-      where: { customerId: id },
+      where: {
+        customerId: id,
+        OR: [
+          { invoiceId: null },
+          {
+            invoice: {
+              status: { notIn: ['Cancelled', 'Draft'] }
+            }
+          }
+        ]
+      },
       include: {
         invoice: {
           select: { id: true, invoiceNumber: true }

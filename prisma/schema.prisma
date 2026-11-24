@@ -98,6 +98,24 @@ model Customer {
   payments Payment[]
 }
 
+model Company {
+  id        String    @id @default(uuid())
+  name      String    @unique
+  code      String?
+  taxId     String?
+  email     String?
+  phone     String?
+  address   String?
+  city      String?
+  country   String?   @default("Uganda")
+  currency  String?   @default("USh")
+  isDefault Boolean   @default(false)
+  status    Status    @default(Active)
+  invoices  Invoice[]
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+}
+
 enum PaymentType {
   CASH
   BANK
@@ -138,6 +156,9 @@ model Invoice {
 
   supplierId String?
   supplier   Supplier? @relation(fields: [supplierId], references: [id])
+
+  companyId String?
+  company   Company?  @relation(fields: [companyId], references: [id])
 
   imageUrl    String?
   attachments Json?

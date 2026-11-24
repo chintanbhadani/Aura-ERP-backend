@@ -78,11 +78,12 @@ router.get('/:id/ledger', async (req: Request, res: Response) => {
       return res.status(404).json({ error: 'Supplier not found' });
     }
 
-    // 1. Fetch all PURCHASE invoices for this supplier
+    // 1. Fetch all PURCHASE invoices for this supplier (excluding Cancelled & Draft)
     const invoices = await prisma.invoice.findMany({
       where: {
         supplierId: id,
         type: 'PURCHASE',
+        status: { notIn: ['Cancelled', 'Draft'] },
       },
       include: {
         items: {
@@ -97,9 +98,19 @@ router.get('/:id/ledger', async (req: Request, res: Response) => {
       orderBy: { date: 'asc' },
     });
 
-    // 2. Fetch all payments linked to this supplier
+    // 2. Fetch all payments linked to this supplier (excluding those linked to cancelled invoices)
     const payments = await prisma.payment.findMany({
-      where: { supplierId: id },
+      where: {
+        supplierId: id,
+        OR: [
+          { invoiceId: null },
+          {
+            invoice: {
+              status: { notIn: ['Cancelled', 'Draft'] }
+            }
+          }
+        ]
+      },
       include: {
         invoice: {
           select: { id: true, invoiceNumber: true }

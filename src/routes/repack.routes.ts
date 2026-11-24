@@ -69,11 +69,12 @@ router.get('/available-po-items', async (req: Request, res: Response) => {
   try {
     await ensureRepackTable();
 
-    // 1. Fetch all purchase items with supplier and product details
+    // 1. Fetch all purchase items with supplier and product details (excluding Cancelled & Draft)
     const purchaseItems = await prisma.invoiceItem.findMany({
       where: {
         invoice: {
           type: 'PURCHASE',
+          status: { notIn: ['Cancelled', 'Draft'] },
         },
       },
       include: {
@@ -96,11 +97,12 @@ router.get('/available-po-items', async (req: Request, res: Response) => {
       },
     });
 
-    // 2. Fetch sales consumption linked to purchase items
+    // 2. Fetch sales consumption linked to purchase items (excluding Cancelled & Draft)
     const salesItems = await prisma.invoiceItem.findMany({
       where: {
         invoice: {
           type: 'SALES',
+          status: { notIn: ['Cancelled', 'Draft'] },
         },
         OR: [
           { purchaseItemId: { not: null } },

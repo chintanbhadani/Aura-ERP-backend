@@ -73,6 +73,7 @@ import subPartOfRoutes from './routes/subPartOf.routes';
 import stockEntryRoutes from './routes/stockEntry.routes';
 import userRoutes from './routes/user.routes';
 import roleRoutes from './routes/role.routes';
+import companyRoutes from './routes/company.routes';
 import repackRoutes from './routes/repack.routes';
 import uploadRoutes from './routes/upload.routes';
 import stockCountRoutes from './routes/stockCount.routes';
@@ -93,6 +94,7 @@ app.use('/api/categories', categoryRoutes);
 app.use('/api/units', unitRoutes);
 app.use('/api/customers', customerRoutes);
 app.use('/api/clients', customerRoutes); // Alias for clients
+app.use('/api/companies', companyRoutes);
 app.use('/api/part-of', partOfRoutes);
 app.use('/api/sub-part-of', subPartOfRoutes);
 app.use('/api/invoices', invoiceRoutes);
