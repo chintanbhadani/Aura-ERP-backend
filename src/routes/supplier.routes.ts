@@ -339,7 +339,8 @@ router.post('/:id/payments', async (req: Request, res: Response) => {
       description,
       invoiceId,
       direction = 'OUT', // Default paying supplier (OUT)
-      allocations
+      allocations,
+      companyId
     } = req.body;
 
     const numAmount = Number(amount);
@@ -350,6 +351,17 @@ router.post('/:id/payments', async (req: Request, res: Response) => {
     const supplier = await prisma.supplier.findUnique({ where: { id } });
     if (!supplier) {
       return res.status(404).json({ error: 'Supplier not found' });
+    }
+
+    // Resolve companyId: if not directly provided, find from default company or invoice
+    let resolvedCompanyId = companyId || null;
+    if (!resolvedCompanyId && invoiceId) {
+      const inv = await prisma.invoice.findUnique({ where: { id: invoiceId }, select: { companyId: true } });
+      if (inv?.companyId) resolvedCompanyId = inv.companyId;
+    }
+    if (!resolvedCompanyId) {
+      const defComp = await prisma.company.findFirst({ where: { isDefault: true }, select: { id: true } });
+      if (defComp?.id) resolvedCompanyId = defComp.id;
     }
 
     const pType = paymentType || 'CASH';
@@ -375,6 +387,7 @@ router.post('/:id/payments', async (req: Request, res: Response) => {
                 description: alloc.description || description || `Payment made for ${alloc.refNo || 'invoice'}`,
                 supplierId: id,
                 invoiceId: alloc.invoiceId || null,
+                companyId: resolvedCompanyId || null,
               }
             });
             createdPayments.push(p);
@@ -393,6 +406,7 @@ router.post('/:id/payments', async (req: Request, res: Response) => {
               description: description ? `${description} (Advance on Account)` : `Advance payment to supplier ${supplier.name}`,
               supplierId: id,
               invoiceId: null,
+              companyId: resolvedCompanyId || null,
             }
           });
           createdPayments.push(advP);
@@ -408,6 +422,7 @@ router.post('/:id/payments', async (req: Request, res: Response) => {
             description: description || `Payment made to supplier ${supplier.name}`,
             supplierId: id,
             invoiceId: invoiceId || null,
+            companyId: resolvedCompanyId || null,
           }
         });
         createdPayments.push(payment);

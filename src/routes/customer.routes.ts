@@ -337,7 +337,8 @@ router.post('/:id/payments', async (req: Request, res: Response) => {
       description,
       invoiceId,
       direction = 'IN',
-      allocations
+      allocations,
+      companyId
     } = req.body;
 
     const numAmount = Number(amount);
@@ -348,6 +349,17 @@ router.post('/:id/payments', async (req: Request, res: Response) => {
     const customer = await prisma.customer.findUnique({ where: { id } });
     if (!customer) {
       return res.status(404).json({ error: 'Customer not found' });
+    }
+
+    // Resolve companyId: if not directly provided, find from default company or invoice
+    let resolvedCompanyId = companyId || null;
+    if (!resolvedCompanyId && invoiceId) {
+      const inv = await prisma.invoice.findUnique({ where: { id: invoiceId }, select: { companyId: true } });
+      if (inv?.companyId) resolvedCompanyId = inv.companyId;
+    }
+    if (!resolvedCompanyId) {
+      const defComp = await prisma.company.findFirst({ where: { isDefault: true }, select: { id: true } });
+      if (defComp?.id) resolvedCompanyId = defComp.id;
     }
 
     const pType = paymentType || 'CASH';
@@ -373,6 +385,7 @@ router.post('/:id/payments', async (req: Request, res: Response) => {
                 description: alloc.description || description || `Payment received for ${alloc.refNo || 'invoice'}`,
                 customerId: id,
                 invoiceId: alloc.invoiceId || null,
+                companyId: resolvedCompanyId || null,
               }
             });
             createdPayments.push(p);
@@ -391,6 +404,7 @@ router.post('/:id/payments', async (req: Request, res: Response) => {
               description: description ? `${description} (Advance on Account)` : `Advance on Account from customer ${customer.name}`,
               customerId: id,
               invoiceId: null,
+              companyId: resolvedCompanyId || null,
             }
           });
           createdPayments.push(advP);
@@ -406,6 +420,7 @@ router.post('/:id/payments', async (req: Request, res: Response) => {
             description: description || `Payment received from customer ${customer.name}`,
             customerId: id,
             invoiceId: invoiceId || null,
+            companyId: resolvedCompanyId || null,
           }
         });
         createdPayments.push(payment);

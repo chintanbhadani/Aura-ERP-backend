@@ -7,9 +7,16 @@ const prisma = new PrismaClient();
 // GET all stock ledger entries
 router.get('/', async (req: Request, res: Response) => {
   try {
-    const { search, type, productId, startDate, endDate } = req.query;
+    const { search, type, productId, startDate, endDate, companyId } = req.query;
 
     const whereClause: any = {};
+
+    if (companyId && companyId !== 'ALL') {
+      whereClause.OR = [
+        { invoice: { companyId: String(companyId) } },
+        { product: { companyId: String(companyId) } }
+      ];
+    }
 
     if (type && type !== 'ALL') {
       whereClause.type = String(type);
@@ -31,11 +38,17 @@ router.get('/', async (req: Request, res: Response) => {
 
     if (search) {
       const q = String(search).trim();
-      whereClause.OR = [
-        { product: { name: { contains: q, mode: 'insensitive' } } },
-        { product: { sku: { contains: q, mode: 'insensitive' } } },
-        { invoice: { invoiceNumber: { contains: q, mode: 'insensitive' } } },
+      const searchOR = [
+        { product: { name: { contains: q, mode: 'insensitive' as const } } },
+        { product: { sku: { contains: q, mode: 'insensitive' as const } } },
+        { invoice: { invoiceNumber: { contains: q, mode: 'insensitive' as const } } },
+        { invoice: { company: { name: { contains: q, mode: 'insensitive' as const } } } },
       ];
+      if (whereClause.OR) {
+        whereClause.AND = [{ OR: searchOR }];
+      } else {
+        whereClause.OR = searchOR;
+      }
     }
 
     const ledgers = await prisma.stockLedger.findMany({
@@ -45,12 +58,14 @@ router.get('/', async (req: Request, res: Response) => {
           include: {
             category: true,
             unit: true,
+            company: true,
           },
         },
         invoice: {
           include: {
             customer: true,
             supplier: true,
+            company: true,
           },
         },
       },
@@ -72,6 +87,7 @@ router.get('/', async (req: Request, res: Response) => {
             location: l.product.location || '',
             category: l.product.category ? { name: l.product.category.name } : undefined,
             unit: l.product.unit ? { name: l.product.unit.name } : undefined,
+            company: l.product.company ? { id: l.product.company.id, name: l.product.company.name, code: l.product.company.code } : undefined,
           }
         : undefined,
       date: l.date.toISOString(),
@@ -79,6 +95,9 @@ router.get('/', async (req: Request, res: Response) => {
       quantityChange: l.quantityChange,
       runningBalance: l.runningBalance,
       invoiceId: l.invoiceId,
+      companyId: l.invoice?.companyId || l.product?.companyId || null,
+      companyName: l.invoice?.company?.name || l.product?.company?.name || 'All Companies',
+      companyCode: l.invoice?.company?.code || l.product?.company?.code || '',
       invoice: l.invoice
         ? {
             id: l.invoice.id,
@@ -87,6 +106,7 @@ router.get('/', async (req: Request, res: Response) => {
             date: l.invoice.date.toISOString(),
             client: l.invoice.customer ? { companyName: l.invoice.customer.name } : null,
             supplier: l.invoice.supplier ? { name: l.invoice.supplier.name } : null,
+            company: l.invoice.company ? { id: l.invoice.company.id, name: l.invoice.company.name, code: l.invoice.company.code } : null,
           }
         : null,
       createdAt: l.createdAt.toISOString(),

@@ -1,5 +1,5 @@
 import { Router, Request, Response } from 'express';
-import { PrismaClient } from '@prisma/client';
+import { PrismaClient, Prisma } from '@prisma/client';
 
 const router = Router();
 const prisma = new PrismaClient();
@@ -189,21 +189,55 @@ router.get('/cash-book', async (req: Request, res: Response) => {
     const { startDate, endDate, search } = req.query;
 
     // 1. Fetch initial configuration
+    const { companyId } = req.query;
     let config = await prisma.cashBookConfig.findFirst({ where: { key: 'DEFAULT' } });
     const initialCash = config ? Number(config.initialOpeningCash) : 0;
     const initialBank = config ? Number(config.initialOpeningBank) : 0;
     const initialAirtel = config ? Number(config.initialOpeningAirtel) : 0;
 
+    const invoiceWhere: any = {
+      status: { notIn: ['Cancelled', 'Draft'] }
+    };
+    if (companyId && companyId !== 'ALL') {
+      invoiceWhere.companyId = String(companyId);
+    }
+
+    const expenseWhere: any = {};
+    if (companyId && companyId !== 'ALL') {
+      expenseWhere.companyId = String(companyId);
+    }
+
+    const paymentWhere: any = {
+      OR: [
+        { invoiceId: null },
+        {
+          invoice: {
+            status: { notIn: ['Cancelled', 'Draft'] }
+          }
+        }
+      ]
+    };
+    if (companyId && companyId !== 'ALL') {
+      paymentWhere.AND = [
+        {
+          OR: [
+            { invoice: { companyId: String(companyId) } },
+            { companyId: String(companyId) },
+            { companyId: null, invoiceId: null }
+          ]
+        }
+      ];
+    }
+
     // 2. Fetch all transactions chronologically (excluding Cancelled & Draft invoices)
     const [invoices, expenses, payments] = await Promise.all([
       prisma.invoice.findMany({
-        where: {
-          status: { notIn: ['Cancelled', 'Draft'] }
-        },
+        where: invoiceWhere,
         orderBy: { date: 'asc' },
         include: {
           customer: { select: { id: true, name: true, contact: true } },
           supplier: { select: { id: true, name: true, contact: true } },
+          company: { select: { id: true, name: true, code: true } },
           items: {
             include: {
               product: { select: { id: true, name: true, sku: true } }
@@ -212,23 +246,19 @@ router.get('/cash-book', async (req: Request, res: Response) => {
         }
       }),
       prisma.expense.findMany({
-        orderBy: { date: 'asc' }
+        where: expenseWhere,
+        orderBy: { date: 'asc' },
+        include: {
+          company: { select: { id: true, name: true, code: true } }
+        }
       }),
       prisma.payment.findMany({
-        where: {
-          OR: [
-            { invoiceId: null },
-            {
-              invoice: {
-                status: { notIn: ['Cancelled', 'Draft'] }
-              }
-            }
-          ]
-        },
+        where: paymentWhere,
         orderBy: { date: 'asc' },
         include: {
           customer: { select: { id: true, name: true } },
-          supplier: { select: { id: true, name: true } }
+          supplier: { select: { id: true, name: true } },
+          company: { select: { id: true, name: true, code: true } }
         }
       })
     ]);
@@ -354,6 +384,8 @@ router.get('/cash-book', async (req: Request, res: Response) => {
       let dayCashOutFromBank = 0;
       let dayBankCustomerIn = 0;
       let dayBankSupplierOut = 0;
+      let dayMobileMoneyCustomerIn = 0;
+      let dayMobileMoneySupplierOut = 0;
 
       for (const pay of dayPayments) {
         const amt = Number(pay.amount || 0);
@@ -390,10 +422,28 @@ router.get('/cash-book', async (req: Request, res: Response) => {
           if (dir === 'IN') {
             if (isCustomerPayment) {
               dayBankCustomerIn += amt;
+            } else {
+              dayBankSales += amt;
             }
           } else if (dir === 'OUT') {
             if (isSupplierPayment) {
               dayBankSupplierOut += amt;
+            } else {
+              dayBankExpenses += amt;
+            }
+          }
+        } else if (pType === 'MOBILE_MONEY') {
+          if (dir === 'IN') {
+            if (isCustomerPayment) {
+              dayMobileMoneyCustomerIn += amt;
+            } else {
+              dayMobileMoneySales += amt;
+            }
+          } else if (dir === 'OUT') {
+            if (isSupplierPayment) {
+              dayMobileMoneySupplierOut += amt;
+            } else {
+              dayMobileMoneyExpenses += amt;
             }
           }
         }
@@ -414,9 +464,9 @@ router.get('/cash-book', async (req: Request, res: Response) => {
       // Update rolling balances
       runningStoreCash = dayClosingCash;
       runningBank += (dayBankSales + dayCashInBank + dayBankCustomerIn) - (dayBankPurchases + dayBankExpenses + dayCashOutFromBank + dayBankSupplierOut);
-      runningAirtel += (dayMobileMoneySales - dayMobileMoneyPurchases - dayMobileMoneyExpenses);
-      runningCreditReceivable += (dayCreditSales - dayReceivedCreditSale - dayBankCustomerIn);
-      runningCreditPayable += (dayCreditPurchases - dayCashPaymentForPurchase - dayBankSupplierOut);
+      runningAirtel += (dayMobileMoneySales + dayMobileMoneyCustomerIn) - (dayMobileMoneyPurchases + dayMobileMoneyExpenses + dayMobileMoneySupplierOut);
+      runningCreditReceivable += (dayCreditSales - dayReceivedCreditSale - dayBankCustomerIn - dayMobileMoneyCustomerIn);
+      runningCreditPayable += (dayCreditPurchases - dayCashPaymentForPurchase - dayBankSupplierOut - dayMobileMoneySupplierOut);
 
       allCalculatedDays.push({
         date: dStr,
@@ -430,10 +480,13 @@ router.get('/cash-book', async (req: Request, res: Response) => {
         cashPurchase: dayCashPurchases,
         cashExpense: dayCashExpenses,
         cashPaymentForPurchase: dayCashPaymentForPurchase,
+        mobileMoneyPaymentForPurchase: dayMobileMoneySupplierOut,
+        bankPaymentForPurchase: dayBankSupplierOut,
+        mobileMoneyCustomerIn: dayMobileMoneyCustomerIn,
         cashInBank: dayCashInBank,
         cashOutFromBank: dayCashOutFromBank,
         closingBalance: dayClosingCash,
-        hasActivity: (dayTotalSales + dayTotalPurchases + dayCashExpenses + dayBankExpenses + dayPayments.length) > 0,
+        hasActivity: (dayTotalSales + dayTotalPurchases + dayCashExpenses + dayBankExpenses + dayMobileMoneyExpenses + dayPayments.length) > 0,
         details: {
           sales: dayInvoices.filter(i => i.type === 'SALES'),
           purchases: dayInvoices.filter(i => i.type === 'PURCHASE'),
@@ -470,6 +523,8 @@ router.get('/cash-book', async (req: Request, res: Response) => {
       cashPurchase: acc.cashPurchase + d.cashPurchase,
       cashExpense: acc.cashExpense + d.cashExpense,
       cashPaymentForPurchase: acc.cashPaymentForPurchase + d.cashPaymentForPurchase,
+      mobileMoneyPaymentForPurchase: (acc.mobileMoneyPaymentForPurchase || 0) + (d.mobileMoneyPaymentForPurchase || 0),
+      bankPaymentForPurchase: (acc.bankPaymentForPurchase || 0) + (d.bankPaymentForPurchase || 0),
       cashInBank: acc.cashInBank + d.cashInBank,
       cashOutFromBank: acc.cashOutFromBank + d.cashOutFromBank,
     }), {
@@ -482,9 +537,89 @@ router.get('/cash-book', async (req: Request, res: Response) => {
       cashPurchase: 0,
       cashExpense: 0,
       cashPaymentForPurchase: 0,
+      mobileMoneyPaymentForPurchase: 0,
+      bankPaymentForPurchase: 0,
       cashInBank: 0,
       cashOutFromBank: 0,
     });
+
+    // Calculate live Inventory / Stock Valuation for Finance Balance Sheet
+    const productWhere: any = {};
+    if (companyId && companyId !== 'ALL') {
+      productWhere.OR = [
+        { companyId: String(companyId) },
+        { invoiceItems: { some: { invoice: { companyId: String(companyId), status: { notIn: ['Cancelled', 'Draft'] } } } } },
+        { stockLedgers: { some: { invoice: { companyId: String(companyId), status: { notIn: ['Cancelled', 'Draft'] } } } } }
+      ];
+    }
+
+    const allProducts = await prisma.product.findMany({
+      where: productWhere,
+      select: {
+        id: true,
+        quantity: true,
+        cost_price: true,
+        selling_price: true,
+      }
+    });
+
+    const pIds = allProducts.map(p => p.id);
+    let totalStockValuation = 0;
+    let totalSalesValuation = 0;
+    let totalStockQuantity = 0;
+
+    if (pIds.length > 0) {
+      // Latest purchase rates
+      const purchaseRates = await prisma.invoiceItem.findMany({
+        where: {
+          productId: { in: pIds },
+          invoice: {
+            type: 'PURCHASE',
+            status: { notIn: ['Cancelled', 'Draft'] },
+            ...(companyId && companyId !== 'ALL' ? { companyId: String(companyId) } : {})
+          }
+        },
+        select: {
+          productId: true,
+          unitPrice: true,
+          invoice: { select: { date: true } }
+        },
+        orderBy: { invoice: { date: 'desc' } }
+      });
+
+      const pRateMap = new Map<string, number>();
+      for (const pi of purchaseRates) {
+        if (!pRateMap.has(pi.productId)) {
+          pRateMap.set(pi.productId, Number(pi.unitPrice) || 0);
+        }
+      }
+
+      // Live ledger quantities
+      const stockLedgerSums: any = await prisma.$queryRaw`
+        SELECT 
+          sl."productId", 
+          SUM(sl."quantityChange") AS "ledgerSum"
+        FROM "StockLedger" sl
+        WHERE sl."productId" IN (${Prisma.join(pIds)})
+        GROUP BY sl."productId"
+      `;
+      const qtyMap = new Map<string, number>();
+      for (const s of stockLedgerSums) {
+        qtyMap.set(s.productId, Number(s.ledgerSum) || 0);
+      }
+
+      for (const prod of allProducts) {
+        const qty = qtyMap.has(prod.id) ? qtyMap.get(prod.id)! : (Number(prod.quantity) || 0);
+        const pRate = pRateMap.has(prod.id) ? pRateMap.get(prod.id)! : (Number(prod.cost_price) || 0);
+        const sRate = Number(prod.selling_price) || 0;
+
+        if (qty > 0) {
+          totalStockQuantity += qty;
+          totalStockValuation += qty * pRate;
+          totalSalesValuation += qty * sRate;
+        }
+      }
+    }
 
     res.json({
       summary: {
@@ -493,6 +628,9 @@ router.get('/cash-book', async (req: Request, res: Response) => {
         currentAirtelBalance: runningAirtel,
         totalCreditReceivable: Math.max(0, runningCreditReceivable),
         totalCreditPayable: Math.max(0, runningCreditPayable),
+        stockValuation: totalStockValuation,
+        salesValuation: totalSalesValuation,
+        totalStockQuantity,
         initialCash,
         initialBank,
         initialAirtel,
@@ -515,14 +653,19 @@ router.get('/daily-cash-flow', async (req: Request, res: Response) => {
 // GET Sales Report with Purchase Price, Sales Price, Date-wise Client & Supplier details
 router.get('/sales-summary', async (req: Request, res: Response) => {
   try {
-    const { startDate, endDate, search, customerId, supplierId, productId } = req.query;
+    const { startDate, endDate, search, customerId, supplierId, productId, companyId } = req.query;
+
+    const purchaseWhere: any = {
+      type: 'PURCHASE',
+      status: { notIn: ['Cancelled', 'Draft'] }
+    };
+    if (companyId && companyId !== 'ALL') {
+      purchaseWhere.companyId = String(companyId);
+    }
 
     // 1. Fetch all purchase invoices to map PO -> Supplier (excluding Cancelled & Draft)
     const purchaseInvoices = await prisma.invoice.findMany({
-      where: {
-        type: 'PURCHASE',
-        status: { notIn: ['Cancelled', 'Draft'] }
-      },
+      where: purchaseWhere,
       include: {
         supplier: true,
         items: true,
@@ -553,6 +696,10 @@ router.get('/sales-summary', async (req: Request, res: Response) => {
       status: { notIn: ['Cancelled', 'Draft'] }
     };
 
+    if (companyId && companyId !== 'ALL') {
+      whereClause.companyId = String(companyId);
+    }
+
     if (customerId) {
       whereClause.customerId = String(customerId);
     }
@@ -575,6 +722,7 @@ router.get('/sales-summary', async (req: Request, res: Response) => {
       where: whereClause,
       include: {
         customer: true,
+        company: true,
         items: {
           include: {
             product: {
@@ -686,6 +834,9 @@ router.get('/sales-summary', async (req: Request, res: Response) => {
           date: inv.date.toISOString(),
           createdAt: inv.createdAt.toISOString(),
           paymentType: inv.paymentType,
+          companyId: inv.companyId || null,
+          companyName: (inv as any).company?.name || 'All Companies',
+          companyCode: (inv as any).company?.code || '',
           clientName,
           clientContact,
           customerId: inv.customerId,
@@ -741,17 +892,43 @@ router.get('/sales-summary', async (req: Request, res: Response) => {
 // GET party ledger summary report (all customers and suppliers)
 router.get('/party-ledger', async (req: Request, res: Response) => {
   try {
-    const { type, search } = req.query; // type: 'ALL' | 'CUSTOMER' | 'SUPPLIER'
+    const { type, search, companyId } = req.query; // type: 'ALL' | 'CUSTOMER' | 'SUPPLIER'
+
+    const customerInvoiceWhere: any = {
+      type: 'SALES',
+      status: { notIn: ['Cancelled', 'Draft'] }
+    };
+    if (companyId && companyId !== 'ALL') {
+      customerInvoiceWhere.companyId = String(companyId);
+    }
+
+    const customerPaymentWhere: any = {
+      OR: [
+        { invoiceId: null },
+        {
+          invoice: {
+            status: { notIn: ['Cancelled', 'Draft'] }
+          }
+        }
+      ]
+    };
+    if (companyId && companyId !== 'ALL') {
+      customerPaymentWhere.AND = [
+        {
+          OR: [
+            { invoice: { companyId: String(companyId) } },
+            { companyId: String(companyId) }
+          ]
+        }
+      ];
+    }
 
     // Fetch customers
     const customers = await prisma.customer.findMany({
       where: search ? { name: { contains: search as string, mode: 'insensitive' } } : {},
       include: {
         invoices: {
-          where: {
-            type: 'SALES',
-            status: { notIn: ['Cancelled', 'Draft'] }
-          },
+          where: customerInvoiceWhere,
           select: {
             id: true,
             invoiceNumber: true,
@@ -764,16 +941,7 @@ router.get('/party-ledger', async (req: Request, res: Response) => {
           }
         },
         payments: {
-          where: {
-            OR: [
-              { invoiceId: null },
-              {
-                invoice: {
-                  status: { notIn: ['Cancelled', 'Draft'] }
-                }
-              }
-            ]
-          },
+          where: customerPaymentWhere,
           select: {
             id: true,
             amount: true,
@@ -786,15 +954,41 @@ router.get('/party-ledger', async (req: Request, res: Response) => {
       orderBy: { name: 'asc' }
     });
 
+    const supplierInvoiceWhere: any = {
+      type: 'PURCHASE',
+      status: { notIn: ['Cancelled', 'Draft'] }
+    };
+    if (companyId && companyId !== 'ALL') {
+      supplierInvoiceWhere.companyId = String(companyId);
+    }
+
+    const supplierPaymentWhere: any = {
+      OR: [
+        { invoiceId: null },
+        {
+          invoice: {
+            status: { notIn: ['Cancelled', 'Draft'] }
+          }
+        }
+      ]
+    };
+    if (companyId && companyId !== 'ALL') {
+      supplierPaymentWhere.AND = [
+        {
+          OR: [
+            { invoice: { companyId: String(companyId) } },
+            { companyId: String(companyId) }
+          ]
+        }
+      ];
+    }
+
     // Fetch suppliers
     const suppliers = await prisma.supplier.findMany({
       where: search ? { name: { contains: search as string, mode: 'insensitive' } } : {},
       include: {
         invoices: {
-          where: {
-            type: 'PURCHASE',
-            status: { notIn: ['Cancelled', 'Draft'] }
-          },
+          where: supplierInvoiceWhere,
           select: {
             id: true,
             invoiceNumber: true,
@@ -807,16 +1001,7 @@ router.get('/party-ledger', async (req: Request, res: Response) => {
           }
         },
         payments: {
-          where: {
-            OR: [
-              { invoiceId: null },
-              {
-                invoice: {
-                  status: { notIn: ['Cancelled', 'Draft'] }
-                }
-              }
-            ]
-          },
+          where: supplierPaymentWhere,
           select: {
             id: true,
             amount: true,

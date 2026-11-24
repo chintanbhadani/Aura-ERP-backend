@@ -27,9 +27,14 @@ const DEFAULT_DESCRIPTIONS = [
 // GET all expenses
 router.get('/', async (req: Request, res: Response) => {
   try {
-    const { search, startDate, endDate } = req.query;
+    const { search, startDate, endDate, companyId } = req.query;
 
     const where: any = {};
+
+    if (companyId && companyId !== 'ALL') {
+      where.companyId = String(companyId);
+    }
+
     if (search) {
       where.description = {
         contains: String(search),
@@ -45,6 +50,9 @@ router.get('/', async (req: Request, res: Response) => {
 
     const expenses = await prisma.expense.findMany({
       where,
+      include: {
+        company: true,
+      },
       orderBy: { updatedAt: 'desc' },
     });
 
@@ -118,7 +126,7 @@ router.post('/descriptions', async (req: Request, res: Response) => {
 // POST new expense
 router.post('/', async (req: Request, res: Response) => {
   try {
-    const { date, description, amount, notes, paymentType } = req.body;
+    const { date, description, amount, notes, paymentType, companyId } = req.body;
 
     if (!description || !description.trim()) {
       return res.status(400).json({ error: 'Description is required' });
@@ -149,6 +157,7 @@ router.post('/', async (req: Request, res: Response) => {
           amount: Number(amount),
           notes: notes ? notes.trim() : null,
           paymentType: paymentType || 'CASH',
+          companyId: companyId || null,
         },
       });
 
@@ -197,7 +206,7 @@ router.post('/', async (req: Request, res: Response) => {
 router.put('/:id', async (req: Request, res: Response) => {
   try {
     const { id } = req.params;
-    const { date, description, amount, notes, paymentType } = req.body;
+    const { date, description, amount, notes, paymentType, companyId } = req.body;
 
     if (!description || !description.trim()) {
       return res.status(400).json({ error: 'Description is required' });
@@ -227,6 +236,7 @@ router.put('/:id', async (req: Request, res: Response) => {
         amount: Number(amount),
         notes: notes !== undefined ? (notes ? notes.trim() : null) : undefined,
         paymentType: paymentType || undefined,
+        companyId: companyId !== undefined ? (companyId || null) : undefined,
       },
     });
 

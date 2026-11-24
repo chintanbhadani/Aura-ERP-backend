@@ -309,18 +309,32 @@ router.get('/bin-report', async (req: Request, res: Response) => {
     // Proactively heal any desynchronization between Product.quantity and StockLedger
     await syncProductQuantitiesWithLedger();
 
-    const { search, warehouse, itemGroup, filter } = req.query;
+    const { search, warehouse, itemGroup, filter, companyId } = req.query;
 
     const whereClause: any = {};
 
+    if (companyId && companyId !== 'ALL') {
+      whereClause.OR = [
+        { companyId: String(companyId) },
+        { invoiceItems: { some: { invoice: { companyId: String(companyId), status: { notIn: ['Cancelled', 'Draft'] } } } } },
+        { stockLedgers: { some: { invoice: { companyId: String(companyId), status: { notIn: ['Cancelled', 'Draft'] } } } } }
+      ];
+    }
+
     if (search) {
       const q = String(search).trim();
-      whereClause.OR = [
-        { name: { contains: q, mode: 'insensitive' } },
-        { sku: { contains: q, mode: 'insensitive' } },
-        { location: { contains: q, mode: 'insensitive' } },
-        { category: { name: { contains: q, mode: 'insensitive' } } },
+      const searchConditions = [
+        { name: { contains: q, mode: 'insensitive' as const } },
+        { sku: { contains: q, mode: 'insensitive' as const } },
+        { location: { contains: q, mode: 'insensitive' as const } },
+        { category: { name: { contains: q, mode: 'insensitive' as const } } },
+        { company: { name: { contains: q, mode: 'insensitive' as const } } },
       ];
+      if (whereClause.OR) {
+        whereClause.AND = [{ OR: searchConditions }];
+      } else {
+        whereClause.OR = searchConditions;
+      }
     }
 
     if (warehouse && warehouse !== 'ALL') {
@@ -336,6 +350,13 @@ router.get('/bin-report', async (req: Request, res: Response) => {
       include: {
         category: true,
         unit: true,
+        company: true,
+        invoiceItems: {
+          where: { invoice: { status: { notIn: ['Cancelled', 'Draft'] } } },
+          include: { invoice: { include: { company: true } } },
+          take: 1,
+          orderBy: { invoice: { date: 'desc' } }
+        }
       },
       orderBy: { name: 'asc' },
     });
@@ -343,18 +364,82 @@ router.get('/bin-report', async (req: Request, res: Response) => {
     // Also fetch live cumulative StockLedger sums for all these products to guarantee 100% audit consistency
     const productIds = products.map((p) => p.id);
     const ledgerMap = new Map<string, number>();
+    const purchaseRatesMap = new Map<string, number>();
+    const sellingRatesMap = new Map<string, number>();
+    const purchasedTotalsMap = new Map<string, number>();
+    const soldTotalsMap = new Map<string, number>();
 
     if (productIds.length > 0) {
-      const ledgerSums: any = await prisma.$queryRaw`
-        SELECT 
-          sl."productId", 
-          SUM(sl."quantityChange") AS "ledgerSum"
-        FROM "StockLedger" sl
-        WHERE sl."productId" IN (${Prisma.join(productIds)})
-        GROUP BY sl."productId"
-      `;
+      let ledgerSums: any;
+      if (companyId && companyId !== 'ALL') {
+        ledgerSums = await prisma.$queryRaw`
+          SELECT 
+            sl."productId", 
+            SUM(sl."quantityChange") AS "ledgerSum"
+          FROM "StockLedger" sl
+          LEFT JOIN "Invoice" inv ON inv.id = sl."invoiceId"
+          WHERE sl."productId" IN (${Prisma.join(productIds)})
+            AND (inv."companyId" = ${String(companyId)} OR (sl."invoiceId" IS NULL AND EXISTS (SELECT 1 FROM "Product" p WHERE p.id = sl."productId" AND p."companyId" = ${String(companyId)})))
+          GROUP BY sl."productId"
+        `;
+      } else {
+        ledgerSums = await prisma.$queryRaw`
+          SELECT 
+            sl."productId", 
+            SUM(sl."quantityChange") AS "ledgerSum"
+          FROM "StockLedger" sl
+          WHERE sl."productId" IN (${Prisma.join(productIds)})
+          GROUP BY sl."productId"
+        `;
+      }
       for (const row of ledgerSums) {
         ledgerMap.set(row.productId, Number(row.ledgerSum) || 0);
+      }
+
+      // Fetch invoice items for both PURCHASE and SALES to compute rates and invoiced totals
+      const invoiceItems = await prisma.invoiceItem.findMany({
+        where: {
+          productId: { in: productIds },
+          invoice: {
+            status: { notIn: ['Cancelled', 'Draft'] },
+            ...(companyId && companyId !== 'ALL' ? { companyId: String(companyId) } : {})
+          }
+        },
+        select: {
+          productId: true,
+          unitPrice: true,
+          totalPrice: true,
+          invoice: {
+            select: {
+              type: true,
+              totalAmount: true,
+              date: true
+            }
+          }
+        },
+        orderBy: {
+          invoice: {
+            date: 'desc'
+          }
+        }
+      });
+
+      for (const item of invoiceItems) {
+        const pId = item.productId;
+        const uPrice = Number(item.unitPrice) || 0;
+        const tPrice = Number(item.totalPrice) || 0;
+
+        if (item.invoice.type === 'PURCHASE') {
+          if (!purchaseRatesMap.has(pId)) {
+            purchaseRatesMap.set(pId, uPrice);
+          }
+          purchasedTotalsMap.set(pId, (purchasedTotalsMap.get(pId) || 0) + tPrice);
+        } else if (item.invoice.type === 'SALES') {
+          if (!sellingRatesMap.has(pId)) {
+            sellingRatesMap.set(pId, uPrice);
+          }
+          soldTotalsMap.set(pId, (soldTotalsMap.get(pId) || 0) + tPrice);
+        }
       }
     }
 
@@ -367,6 +452,29 @@ router.get('/bin-report', async (req: Request, res: Response) => {
 
       // Always display the true cumulative stock ledger balance if ledger entries exist
       const actualQuantity = ledgerMap.has(p.id) ? ledgerMap.get(p.id)! : (Number(p.quantity) || 0);
+      const resolvedCompany = p.company?.name || p.invoiceItems?.[0]?.invoice?.company?.name || 'All Companies';
+      const resolvedCompanyId = p.companyId || p.invoiceItems?.[0]?.invoice?.companyId || null;
+      const resolvedCompanyCode = p.company?.code || p.invoiceItems?.[0]?.invoice?.company?.code || '';
+
+      // Determine purchase rate from latest purchase invoice, fallback to product cost_price
+      const purchaseRate = purchaseRatesMap.has(p.id)
+        ? purchaseRatesMap.get(p.id)!
+        : (Number(p.cost_price) || 0);
+      
+      // Determine selling rate from latest sales invoice, fallback to product selling_price
+      const sellingRate = sellingRatesMap.has(p.id)
+        ? sellingRatesMap.get(p.id)!
+        : (Number(p.selling_price) || 0);
+
+      // Invoiced totals for net invoiced balance calculation (Purchased Value - Sold Value)
+      const totalPurchasedValue = purchasedTotalsMap.get(p.id) || 0;
+      const totalSoldValue = soldTotalsMap.get(p.id) || 0;
+      const netInvoicedBalance = totalPurchasedValue - totalSoldValue;
+
+      // Valuation based on purchase cost of in-stock items
+      const stockValuation = actualQuantity > 0 ? actualQuantity * purchaseRate : 0;
+      // Valuation based on retail selling price of in-stock items
+      const salesValuation = actualQuantity > 0 ? actualQuantity * sellingRate : 0;
 
       return {
         id: p.id,
@@ -377,7 +485,17 @@ router.get('/bin-report', async (req: Request, res: Response) => {
         subPartOf: subPart,
         uom: p.unit?.name || 'Pcs',
         actualQuantity,
+        purchaseRate,
+        sellingRate,
+        stockValuation,
+        salesValuation,
+        totalPurchasedValue,
+        totalSoldValue,
+        netInvoicedBalance,
         warehouse: p.location || 'Main Warehouse',
+        companyId: resolvedCompanyId,
+        companyName: resolvedCompany,
+        companyCode: resolvedCompanyCode,
         assignedTo: 'Plant Store',
         tags: actualQuantity <= p.min_stock ? 'LOW STOCK' : 'IN STOCK',
       };

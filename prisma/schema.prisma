@@ -59,6 +59,8 @@ model Product {
   invoiceDate   DateTime?
   unitId        String?
   unit          Unit?         @relation(fields: [unitId], references: [id])
+  companyId     String?
+  company       Company?      @relation(fields: [companyId], references: [id])
   invoiceItems  InvoiceItem[]
   stockLedgers  StockLedger[]
   repackSources RepackEntry[] @relation("RepackSource")
@@ -112,6 +114,9 @@ model Company {
   isDefault Boolean   @default(false)
   status    Status    @default(Active)
   invoices  Invoice[]
+  products  Product[]
+  expenses  Expense[]
+  payments  Payment[]
   createdAt DateTime  @default(now())
   updatedAt DateTime  @updatedAt
 }
@@ -198,6 +203,8 @@ model Expense {
   amount      Decimal  @db.Decimal(10, 2)
   paymentType PaymentType @default(CASH)
   notes       String?
+  companyId   String?
+  company     Company? @relation(fields: [companyId], references: [id])
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 }
@@ -238,6 +245,9 @@ model Payment {
   
   invoiceId     String?
   invoice       Invoice?    @relation(fields: [invoiceId], references: [id])
+
+  companyId     String?
+  company       Company?    @relation(fields: [companyId], references: [id])
 
   createdAt     DateTime    @default(now())
   updatedAt     DateTime    @updatedAt
