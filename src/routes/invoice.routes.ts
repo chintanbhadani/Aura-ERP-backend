@@ -1790,18 +1790,22 @@ router.post('/bulk-submit', async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'No invoice IDs provided' });
     }
 
-    const draftInvoices = await prisma.invoice.findMany({
-      where: {
-        id: { in: ids },
-        status: 'Draft',
-      },
-      include: {
-        items: true,
-      },
+    const targetInvoices = await prisma.invoice.findMany({
+      where: { id: { in: ids } },
+      include: { items: true },
+    });
+
+    if (targetInvoices.length === 0) {
+      return res.status(400).json({ error: 'No matching invoices found.' });
+    }
+
+    const draftInvoices = targetInvoices.filter(inv => {
+      const st = String(inv.status || 'Draft').trim().toLowerCase();
+      return st === 'draft';
     });
 
     if (draftInvoices.length === 0) {
-      return res.status(400).json({ error: 'No draft invoices found to submit' });
+      return res.status(400).json({ error: 'None of the selected invoices are in Draft status.' });
     }
 
     let submittedCount = 0;
@@ -2016,6 +2020,223 @@ router.post('/bulk-submit', async (req: Request, res: Response) => {
   } catch (error: any) {
     logger.error('Bulk submit invoices error:', { error: error?.message || error, stack: error?.stack });
     res.status(500).json({ error: error.message || 'Failed to submit invoices' });
+  }
+});
+
+// POST bulk cancel invoices (must be defined BEFORE /:id/cancel)
+router.post('/bulk-cancel', async (req: Request, res: Response) => {
+  try {
+    await ensureInvoiceColumns();
+    const { ids } = req.body;
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).json({ error: 'No invoice IDs provided' });
+    }
+
+    let cancelledCount = 0;
+    const errors: string[] = [];
+
+    for (const id of ids) {
+      try {
+        const existingInvoice = await prisma.invoice.findUnique({
+          where: { id },
+          include: { items: true },
+        });
+
+        if (!existingInvoice) {
+          errors.push(`Invoice ${id} not found.`);
+          continue;
+        }
+
+        if (existingInvoice.status === 'Cancelled') {
+          continue; // already cancelled, skip
+        }
+
+        const isDraft = !existingInvoice.status || String(existingInvoice.status).trim().toLowerCase() === 'draft';
+
+        if (existingInvoice.type === 'SALES') {
+          await prisma.$transaction(async (tx) => {
+            if (!isDraft) {
+              const cancelDate = new Date();
+              for (const item of existingInvoice.items) {
+                if (!item.productId) continue;
+                const qty = Math.round(Number(item.quantity));
+                const revertQty = qty;
+
+                const currentBalanceResult: any = await tx.$queryRaw`
+                  SELECT COALESCE(SUM("quantityChange"), 0) AS balance_before
+                  FROM "StockLedger"
+                  WHERE "productId" = ${item.productId}
+                    AND date < ${cancelDate}::TIMESTAMP
+                `;
+                const balanceBefore = currentBalanceResult[0]?.balance_before ? Number(currentBalanceResult[0].balance_before) : 0;
+
+                await tx.stockLedger.create({
+                  data: {
+                    productId: item.productId,
+                    date: cancelDate,
+                    type: 'SALES_CANCEL',
+                    quantityChange: revertQty,
+                    runningBalance: balanceBefore + revertQty,
+                    invoiceId: id,
+                  }
+                });
+
+                await tx.$queryRaw`
+                  UPDATE "StockLedger"
+                  SET "runningBalance" = "runningBalance" + ${revertQty}
+                  WHERE "productId" = ${item.productId}
+                    AND date > ${cancelDate}::TIMESTAMP
+                `;
+
+                await tx.$executeRaw`
+                  UPDATE "Product"
+                  SET quantity = COALESCE((
+                    SELECT SUM(sl."quantityChange")
+                    FROM "StockLedger" sl
+                    WHERE sl."productId" = ${item.productId}
+                  ), 0)
+                  WHERE id = ${item.productId}
+                `;
+              }
+
+              const oldCashLedgers = await tx.cashLedger.findMany({ where: { invoiceId: id } });
+              for (const cl of oldCashLedgers) {
+                const revertCash = -Number(cl.amountChange);
+                await tx.$queryRaw`
+                  UPDATE "CashLedger"
+                  SET "runningBalance" = "runningBalance" + ${revertCash}
+                  WHERE "paymentType" = ${cl.paymentType}::"PaymentType"
+                    AND date > ${cl.date}::TIMESTAMP
+                `;
+              }
+              await tx.cashLedger.deleteMany({ where: { invoiceId: id } });
+              await tx.payment.deleteMany({ where: { invoiceId: id } });
+            }
+
+            await tx.invoice.update({
+              where: { id },
+              data: { status: 'Cancelled' },
+            });
+          });
+          cancelledCount++;
+        } else if (existingInvoice.type === 'PURCHASE') {
+          const purchaseItemIds = existingInvoice.items.map((i: any) => i.id);
+
+          const directSalesItems = await prisma.invoiceItem.findMany({
+            where: {
+              invoice: {
+                type: 'SALES',
+                status: { not: 'Cancelled' },
+              },
+              OR: [
+                { purchaseItemId: { in: purchaseItemIds } },
+                { purchaseInvoiceNo: existingInvoice.invoiceNumber },
+              ],
+            },
+            include: { invoice: { select: { invoiceNumber: true } } }
+          });
+
+          if (directSalesItems.length > 0) {
+            errors.push(`Invoice ${existingInvoice.invoiceNumber}: Items have already been used in sales invoices.`);
+            continue;
+          }
+
+          if (!isDraft) {
+            let hasStockIssue = false;
+            for (const item of existingInvoice.items) {
+              if (!item.productId) continue;
+              const currentProd = await prisma.product.findUnique({ where: { id: item.productId } });
+              const purchaseQty = Math.round(Number(item.quantity));
+              if (currentProd && currentProd.quantity < purchaseQty) {
+                errors.push(`Invoice ${existingInvoice.invoiceNumber}: Stock for "${currentProd.name}" is already reduced below purchased quantity.`);
+                hasStockIssue = true;
+                break;
+              }
+            }
+            if (hasStockIssue) continue;
+          }
+
+          await prisma.$transaction(async (tx) => {
+            if (!isDraft) {
+              const cancelDate = new Date();
+              for (const item of existingInvoice.items) {
+                if (!item.productId) continue;
+                const qty = Math.round(Number(item.quantity));
+                const revertQty = -qty;
+
+                const currentBalanceResult: any = await tx.$queryRaw`
+                  SELECT COALESCE(SUM("quantityChange"), 0) AS balance_before
+                  FROM "StockLedger"
+                  WHERE "productId" = ${item.productId}
+                    AND date < ${cancelDate}::TIMESTAMP
+                `;
+                const balanceBefore = currentBalanceResult[0]?.balance_before ? Number(currentBalanceResult[0].balance_before) : 0;
+
+                await tx.stockLedger.create({
+                  data: {
+                    productId: item.productId,
+                    date: cancelDate,
+                    type: 'PURCHASE_CANCEL',
+                    quantityChange: revertQty,
+                    runningBalance: balanceBefore + revertQty,
+                    invoiceId: id,
+                  }
+                });
+
+                await tx.$queryRaw`
+                  UPDATE "StockLedger"
+                  SET "runningBalance" = "runningBalance" + ${revertQty}
+                  WHERE "productId" = ${item.productId}
+                    AND date > ${cancelDate}::TIMESTAMP
+                `;
+
+                await tx.$executeRaw`
+                  UPDATE "Product"
+                  SET quantity = COALESCE((
+                    SELECT SUM(sl."quantityChange")
+                    FROM "StockLedger" sl
+                    WHERE sl."productId" = ${item.productId}
+                  ), 0)
+                  WHERE id = ${item.productId}
+                `;
+              }
+
+              const oldCashLedgers = await tx.cashLedger.findMany({ where: { invoiceId: id } });
+              for (const cl of oldCashLedgers) {
+                const revertCash = -Number(cl.amountChange);
+                await tx.$queryRaw`
+                  UPDATE "CashLedger"
+                  SET "runningBalance" = "runningBalance" + ${revertCash}
+                  WHERE "paymentType" = ${cl.paymentType}::"PaymentType"
+                    AND date > ${cl.date}::TIMESTAMP
+                `;
+              }
+              await tx.cashLedger.deleteMany({ where: { invoiceId: id } });
+              await tx.payment.deleteMany({ where: { invoiceId: id } });
+            }
+
+            await tx.invoice.update({
+              where: { id },
+              data: { status: 'Cancelled' },
+            });
+          });
+          cancelledCount++;
+        }
+      } catch (err: any) {
+        errors.push(`Invoice ${id}: ${err.message}`);
+      }
+    }
+
+    await syncProductQuantitiesWithLedger();
+
+    res.json({
+      message: `Successfully cancelled ${cancelledCount} invoice(s).`,
+      cancelledCount,
+      errors: errors.length > 0 ? errors : undefined,
+    });
+  } catch (error: any) {
+    logger.error('Bulk cancel invoices error:', { error: error?.message || error, stack: error?.stack });
+    res.status(500).json({ error: error.message || 'Failed to bulk cancel invoices' });
   }
 });
 
