@@ -2,6 +2,10 @@ import { Router, Request, Response } from 'express';
 import { PrismaClient, InvoiceType, PaymentType, Prisma } from '@prisma/client';
 import multer from 'multer';
 import * as xlsx from 'xlsx';
+import path from 'path';
+import fs from 'fs';
+import logger from '../utils/logger';
+import { syncProductQuantitiesWithLedger } from './inventory.routes';
 
 const upload = multer({ storage: multer.memoryStorage() });
 
@@ -19,8 +23,8 @@ async function ensureInvoiceColumns() {
     await prisma.$executeRawUnsafe(`ALTER TABLE "Invoice" ADD COLUMN IF NOT EXISTS "companyId" TEXT;`);
     await prisma.$executeRawUnsafe(`UPDATE "Invoice" SET "status" = 'Draft' WHERE "status" IS NULL;`);
     invoiceColumnsChecked = true;
-  } catch (err) {
-    console.error('Error ensuring Invoice columns:', err);
+  } catch (err: any) {
+    logger.error('Error ensuring Invoice columns:', { error: err?.message || err, stack: err?.stack });
   }
 }
 ensureInvoiceColumns();
@@ -84,7 +88,8 @@ router.get('/', async (req: Request, res: Response) => {
       client: inv.customer ? { ...inv.customer, companyName: inv.customer.name } : null,
     }));
     res.json(formatted);
-  } catch (error) {
+  } catch (error: any) {
+    logger.error('Failed to fetch invoices:', { error: error?.message || error, stack: error?.stack });
     res.status(500).json({ error: 'Failed to fetch invoices' });
   }
 });
@@ -283,7 +288,7 @@ router.get('/available-batches/:productId', async (req: Request, res: Response) 
       statusMessage
     });
   } catch (error: any) {
-    console.error('Error fetching available batches:', error);
+    logger.error('Error fetching available batches:', { error: error?.message || error, stack: error?.stack });
     res.status(500).json({ error: error.message || 'Failed to fetch available batches' });
   }
 });
@@ -332,7 +337,8 @@ router.get('/:id', async (req: Request, res: Response) => {
       client: invoice.customer ? { ...invoice.customer, companyName: invoice.customer.name } : null,
     };
     res.json(formatted);
-  } catch (error) {
+  } catch (error: any) {
+    logger.error('Failed to fetch invoice:', { error: error?.message || error, stack: error?.stack });
     res.status(500).json({ error: 'Failed to fetch invoice' });
   }
 });
@@ -773,7 +779,7 @@ router.post('/', async (req: Request, res: Response) => {
 
     res.status(201).json(result);
   } catch (error: any) {
-    console.error(error);
+    logger.error('Failed to create invoice:', { error: error?.message || error, stack: error?.stack });
     res.status(500).json({ error: error.message || 'Failed to create invoice' });
   }
 });
@@ -1197,7 +1203,7 @@ router.put('/:id', async (req: Request, res: Response) => {
 
     res.json(result);
   } catch (error: any) {
-    console.error('Invoice update error:', error);
+    logger.error('Invoice update error:', { error: error?.message || error, stack: error?.stack });
     res.status(500).json({ error: error.message || 'Failed to update invoice' });
   }
 });
@@ -1240,7 +1246,7 @@ const parseNumber = (val: any): number => {
   return isNaN(num) ? 0 : num;
 };
 
-async function processBulkInvoiceRows(rawRows: any[], defaultType: InvoiceType = 'PURCHASE') {
+async function processBulkInvoiceRows(rawRows: any[], defaultType: InvoiceType = 'PURCHASE', fileMeta?: any) {
   if (!Array.isArray(rawRows) || rawRows.length === 0) {
     return { successCount: 0, createdCount: 0, errors: ['No items provided for import'] };
   }
@@ -1256,6 +1262,7 @@ async function processBulkInvoiceRows(rawRows: any[], defaultType: InvoiceType =
     cashAmount?: number;
     bankAmount?: number;
     notes?: string;
+    status: string;
     items: Array<{
       sku?: string;
       itemName: string;
@@ -1310,6 +1317,9 @@ async function processBulkInvoiceRows(rawRows: any[], defaultType: InvoiceType =
     const cashAmount = row.cashAmount !== undefined ? parseNumber(row.cashAmount) : undefined;
     const bankAmount = row.bankAmount !== undefined ? parseNumber(row.bankAmount) : undefined;
     const notes = (row.notes || row.remarks || row.comment || row['Notes'] || row['Remarks'] || '').toString().trim();
+    const statusRaw = (row.status || row.Status || row['Status'] || 'Draft').toString().trim();
+    const isRowDraft = !statusRaw || statusRaw.toLowerCase() === 'draft';
+    const rowStatus = isRowDraft ? 'Draft' : statusRaw;
 
     if (!partyName) {
       errors.push(`Row ${rowNum}: Party Name (${type === 'PURCHASE' ? 'Supplier' : 'Customer'}) is required.`);
@@ -1329,7 +1339,7 @@ async function processBulkInvoiceRows(rawRows: any[], defaultType: InvoiceType =
       groupKey = `NUM_${type}_${invoiceNumber.toUpperCase()}`;
     } else {
       const dStr = date.toISOString().split('T')[0];
-      groupKey = `AUTO_${type}_${partyName.toUpperCase()}_${dStr}_${paymentType}`;
+      groupKey = `AUTO_${type}_${partyName.toUpperCase()}_${dStr}_${paymentType}_${rowStatus}`;
     }
 
     if (!groups.has(groupKey)) {
@@ -1343,6 +1353,7 @@ async function processBulkInvoiceRows(rawRows: any[], defaultType: InvoiceType =
         cashAmount,
         bankAmount,
         notes: notes || undefined,
+        status: rowStatus,
         items: []
       });
     }
@@ -1540,6 +1551,8 @@ async function processBulkInvoiceRows(rawRows: any[], defaultType: InvoiceType =
         finalCashAmount = totalAmount;
       }
 
+      const isDraft = !group.status || String(group.status).trim().toLowerCase() === 'draft';
+
       // 3. Database Transaction (Invoice + Stock Ledger + Cashflow)
       await prisma.$transaction(async (tx) => {
         // A. Create Invoice & InvoiceItems
@@ -1558,6 +1571,8 @@ async function processBulkInvoiceRows(rawRows: any[], defaultType: InvoiceType =
             bankAmount: finalBankAmount,
             creditAmount: finalCreditAmount,
             mobileMoneyAmount: finalMobileMoneyAmount,
+            status: isDraft ? 'Draft' : (group.status || 'Submitted'),
+            attachments: fileMeta ? [fileMeta] : undefined,
             items: {
               create: resolvedItems.map(item => ({
                 productId: item.productId,
@@ -1570,6 +1585,8 @@ async function processBulkInvoiceRows(rawRows: any[], defaultType: InvoiceType =
           }
         });
 
+        // ONLY record StockLedger, Product quantity update, and Cashflow if invoice is NOT Draft
+        if (!isDraft) {
         // B. Add Ledger Entry: Add or Reduce Stock for each SKU
         for (const item of resolvedItems) {
           const product = await tx.product.findUnique({ where: { id: item.productId } });
@@ -1749,6 +1766,7 @@ async function processBulkInvoiceRows(rawRows: any[], defaultType: InvoiceType =
             }
           });
         }
+        } // end if (!isDraft)
       });
 
       createdInvoicesCount++;
@@ -1758,8 +1776,248 @@ async function processBulkInvoiceRows(rawRows: any[], defaultType: InvoiceType =
     }
   }
 
+  await syncProductQuantitiesWithLedger();
+
   return { successCount, createdCount: createdInvoicesCount, errors };
 }
+
+// POST bulk submit draft invoices
+router.post('/bulk-submit', async (req: Request, res: Response) => {
+  try {
+    await ensureInvoiceColumns();
+    const { ids } = req.body;
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).json({ error: 'No invoice IDs provided' });
+    }
+
+    const draftInvoices = await prisma.invoice.findMany({
+      where: {
+        id: { in: ids },
+        status: 'Draft',
+      },
+      include: {
+        items: true,
+      },
+    });
+
+    if (draftInvoices.length === 0) {
+      return res.status(400).json({ error: 'No draft invoices found to submit' });
+    }
+
+    let submittedCount = 0;
+    const errors: string[] = [];
+
+    for (const inv of draftInvoices) {
+      try {
+        await prisma.$transaction(async (tx) => {
+          const invoiceDate = inv.date;
+
+          // 1. Verify and update Stock Ledger & Product quantities
+          for (const item of inv.items) {
+            const product = await tx.product.findUnique({ where: { id: item.productId } });
+            if (!product) continue;
+
+            const quantityChange = inv.type === 'PURCHASE' ? Number(item.quantity) : -Number(item.quantity);
+
+            // Point-in-time check for sales
+            if (inv.type === 'SALES') {
+              if (product.quantity < Number(item.quantity)) {
+                throw new Error(`Insufficient stock for "${product.name}". Available: ${product.quantity}, requested: ${item.quantity}`);
+              }
+            }
+
+            const currentBalanceResult: any = await tx.$queryRaw`
+              SELECT COALESCE(SUM("quantityChange"), 0) AS balance_before
+              FROM "StockLedger"
+              WHERE "productId" = ${item.productId}
+                AND date < ${invoiceDate}::TIMESTAMP
+            `;
+            const balanceBefore = currentBalanceResult[0]?.balance_before ? Number(currentBalanceResult[0].balance_before) : 0;
+            const newRunningBalance = balanceBefore + quantityChange;
+
+            await tx.stockLedger.create({
+              data: {
+                productId: item.productId,
+                date: invoiceDate,
+                type: inv.type,
+                quantityChange,
+                runningBalance: newRunningBalance,
+                invoiceId: inv.id,
+              }
+            });
+
+            await tx.$queryRaw`
+              UPDATE "StockLedger"
+              SET "runningBalance" = "runningBalance" + ${quantityChange}
+              WHERE "productId" = ${item.productId}
+                AND date > ${invoiceDate}::TIMESTAMP
+            `;
+
+            await tx.product.update({
+              where: { id: item.productId },
+              data: {
+                quantity: product.quantity + quantityChange,
+                ...(inv.type === 'PURCHASE' ? { cost_price: item.unitPrice } : {})
+              }
+            });
+          }
+
+          // 2. Cashflow entries
+          const finalCash = Number(inv.cashAmount) || 0;
+          const finalBank = Number(inv.bankAmount) || 0;
+          const finalMM = Number(inv.mobileMoneyAmount) || 0;
+
+          if (finalCash > 0) {
+            const cashChange = inv.type === 'SALES' ? finalCash : -finalCash;
+            const cashBalRes: any = await tx.$queryRaw`
+              SELECT COALESCE(SUM("amountChange"), 0) AS balance_before
+              FROM "CashLedger"
+              WHERE "paymentType" = 'CASH'
+                AND date < ${invoiceDate}::TIMESTAMP
+            `;
+            const cashBal = cashBalRes[0]?.balance_before ? Number(cashBalRes[0].balance_before) : 0;
+
+            await tx.cashLedger.create({
+              data: {
+                date: invoiceDate,
+                paymentType: 'CASH',
+                sourceType: inv.type === 'SALES' ? 'SALE' : 'PURCHASE',
+                amountChange: cashChange,
+                runningBalance: cashBal + cashChange,
+                invoiceId: inv.id,
+              }
+            });
+
+            await tx.$queryRaw`
+              UPDATE "CashLedger"
+              SET "runningBalance" = "runningBalance" + ${cashChange}
+              WHERE "paymentType" = 'CASH'
+                AND date > ${invoiceDate}::TIMESTAMP
+            `;
+
+            await tx.payment.create({
+              data: {
+                date: invoiceDate,
+                paymentType: 'CASH',
+                direction: inv.type === 'SALES' ? 'IN' : 'OUT',
+                amount: finalCash,
+                description: `${inv.type === 'SALES' ? 'Sale' : 'Purchase'} Invoice ${inv.invoiceNumber}`,
+                customerId: inv.customerId,
+                supplierId: inv.supplierId,
+                invoiceId: inv.id,
+              }
+            });
+          }
+
+          if (finalBank > 0) {
+            const bankChange = inv.type === 'SALES' ? finalBank : -finalBank;
+            const bankBalRes: any = await tx.$queryRaw`
+              SELECT COALESCE(SUM("amountChange"), 0) AS balance_before
+              FROM "CashLedger"
+              WHERE "paymentType" = 'BANK'
+                AND date < ${invoiceDate}::TIMESTAMP
+            `;
+            const bankBal = bankBalRes[0]?.balance_before ? Number(bankBalRes[0].balance_before) : 0;
+
+            await tx.cashLedger.create({
+              data: {
+                date: invoiceDate,
+                paymentType: 'BANK',
+                sourceType: inv.type === 'SALES' ? 'SALE' : 'PURCHASE',
+                amountChange: bankChange,
+                runningBalance: bankBal + bankChange,
+                invoiceId: inv.id,
+              }
+            });
+
+            await tx.$queryRaw`
+              UPDATE "CashLedger"
+              SET "runningBalance" = "runningBalance" + ${bankChange}
+              WHERE "paymentType" = 'BANK'
+                AND date > ${invoiceDate}::TIMESTAMP
+            `;
+
+            await tx.payment.create({
+              data: {
+                date: invoiceDate,
+                paymentType: 'BANK',
+                direction: inv.type === 'SALES' ? 'IN' : 'OUT',
+                amount: finalBank,
+                description: `${inv.type === 'SALES' ? 'Sale' : 'Purchase'} Invoice ${inv.invoiceNumber}`,
+                customerId: inv.customerId,
+                supplierId: inv.supplierId,
+                invoiceId: inv.id,
+              }
+            });
+          }
+
+          if (finalMM > 0) {
+            const mmChange = inv.type === 'SALES' ? finalMM : -finalMM;
+            const mmBalRes: any = await tx.$queryRaw`
+              SELECT COALESCE(SUM("amountChange"), 0) AS balance_before
+              FROM "CashLedger"
+              WHERE "paymentType" = 'MOBILE_MONEY'
+                AND date < ${invoiceDate}::TIMESTAMP
+            `;
+            const mmBal = mmBalRes[0]?.balance_before ? Number(mmBalRes[0].balance_before) : 0;
+
+            await tx.cashLedger.create({
+              data: {
+                date: invoiceDate,
+                paymentType: 'MOBILE_MONEY',
+                sourceType: inv.type === 'SALES' ? 'SALE' : 'PURCHASE',
+                amountChange: mmChange,
+                runningBalance: mmBal + mmChange,
+                invoiceId: inv.id,
+              }
+            });
+
+            await tx.$queryRaw`
+              UPDATE "CashLedger"
+              SET "runningBalance" = "runningBalance" + ${mmChange}
+              WHERE "paymentType" = 'MOBILE_MONEY'
+                AND date > ${invoiceDate}::TIMESTAMP
+            `;
+
+            await tx.payment.create({
+              data: {
+                date: invoiceDate,
+                paymentType: 'MOBILE_MONEY',
+                direction: inv.type === 'SALES' ? 'IN' : 'OUT',
+                amount: finalMM,
+                description: `${inv.type === 'SALES' ? 'Sale' : 'Purchase'} Invoice ${inv.invoiceNumber}`,
+                customerId: inv.customerId,
+                supplierId: inv.supplierId,
+                invoiceId: inv.id,
+              }
+            });
+          }
+
+          // 3. Mark invoice as Submitted
+          await tx.invoice.update({
+            where: { id: inv.id },
+            data: { status: 'Submitted' }
+          });
+        });
+
+        submittedCount++;
+      } catch (err: any) {
+        errors.push(`Invoice ${inv.invoiceNumber}: ${err.message}`);
+      }
+    }
+
+    await syncProductQuantitiesWithLedger();
+
+    res.json({
+      message: `Successfully submitted ${submittedCount} invoice(s).`,
+      submittedCount,
+      errors: errors.length > 0 ? errors : undefined,
+    });
+  } catch (error: any) {
+    logger.error('Bulk submit invoices error:', { error: error?.message || error, stack: error?.stack });
+    res.status(500).json({ error: error.message || 'Failed to submit invoices' });
+  }
+});
 
 // POST bulk import invoices (JSON array)
 router.post('/bulk-import', async (req: Request, res: Response) => {
@@ -1772,7 +2030,7 @@ router.post('/bulk-import', async (req: Request, res: Response) => {
       ...result
     });
   } catch (error: any) {
-    console.error('Bulk import invoices error:', error);
+    logger.error('Bulk import invoices error:', { error: error?.message || error, stack: error?.stack });
     res.status(500).json({ error: error.message || 'Failed to process bulk import' });
   }
 });
@@ -1784,18 +2042,40 @@ router.post('/bulk-upload', upload.single('file'), async (req: Request, res: Res
       return res.status(400).json({ error: 'No file uploaded' });
     }
 
+    // Save uploaded Excel file to disk for audit & permanent record
+    const uploadDir = path.join(process.cwd(), 'uploads', 'bulk_imports', 'invoices');
+    if (!fs.existsSync(uploadDir)) {
+      fs.mkdirSync(uploadDir, { recursive: true });
+    }
+    const safeName = req.file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_');
+    const savedFileName = `${Date.now()}_${safeName}`;
+    const savedFilePath = path.join(uploadDir, savedFileName);
+    await fs.promises.writeFile(savedFilePath, req.file.buffer);
+    const fileUrl = `/uploads/bulk_imports/invoices/${savedFileName}`;
+
+    logger.info('Bulk upload invoices Excel file saved successfully', { originalName: req.file.originalname, fileUrl, size: req.file.size });
+
+    const fileMeta = {
+      name: req.file.originalname,
+      url: fileUrl,
+      size: req.file.size,
+      uploadedAt: new Date().toISOString()
+    };
+
     const defaultType: InvoiceType = (req.body.type === 'SALES' ? 'SALES' : 'PURCHASE');
     const workbook = xlsx.read(req.file.buffer, { type: 'buffer' });
     const sheetName = workbook.SheetNames[0];
     const rawRows = xlsx.utils.sheet_to_json(workbook.Sheets[sheetName]);
 
-    const result = await processBulkInvoiceRows(rawRows, defaultType);
+    const result = await processBulkInvoiceRows(rawRows, defaultType, fileMeta);
     res.json({
       message: `Successfully processed ${result.successCount} item(s) across ${result.createdCount} invoice(s).`,
+      fileUrl,
+      fileName: savedFileName,
       ...result
     });
   } catch (error: any) {
-    console.error('Bulk upload invoices error:', error);
+    logger.error('Bulk upload invoices error:', { error: error?.message || error, stack: error?.stack });
     res.status(500).json({ error: error.message || 'Failed to process bulk upload' });
   }
 });
@@ -2081,7 +2361,7 @@ router.post('/:id/cancel', async (req: Request, res: Response) => {
 
     return res.status(400).json({ error: 'Unsupported invoice type' });
   } catch (error: any) {
-    console.error('Error cancelling invoice:', error);
+    logger.error('Error cancelling invoice:', { error: error?.message || error, stack: error?.stack });
     res.status(500).json({ error: error.message || 'Failed to cancel invoice' });
   }
 });
@@ -2141,6 +2421,7 @@ router.delete('/:id', async (req: Request, res: Response) => {
     });
     res.json({ message: 'Invoice deleted successfully' });
   } catch (error: any) {
+    logger.error('Failed to delete invoice:', { error: error?.message || error, stack: error?.stack });
     res.status(500).json({ error: error.message || 'Failed to delete invoice' });
   }
 });

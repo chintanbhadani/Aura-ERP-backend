@@ -2,6 +2,8 @@ import { Router, Request, Response } from 'express';
 import { PrismaClient, Prisma } from '@prisma/client';
 import multer from 'multer';
 import * as xlsx from 'xlsx';
+import path from 'path';
+import fs from 'fs';
 import logger from '../utils/logger';
 
 const upload = multer({ storage: multer.memoryStorage() });
@@ -17,47 +19,41 @@ const prisma = new PrismaClient();
  */
 export async function syncProductQuantitiesWithLedger() {
   try {
-    // 1. Ensure opening stock is tracked in StockLedger for any product that has quantity > 0 but no ledger entries
-    const productsWithoutLedger: any = await prisma.$queryRaw`
-      SELECT p.id, p.quantity, p."createdAt"
-      FROM "Product" p
-      WHERE p.quantity > 0
-        AND NOT EXISTS (
-          SELECT 1 FROM "StockLedger" sl WHERE sl."productId" = p.id
-        )
+    // 0. Remove any StockLedger, CashLedger, or Payment entries mistakenly linked to Draft or Cancelled invoices
+    await prisma.$executeRaw`
+      DELETE FROM "StockLedger" sl
+      USING "Invoice" inv
+      WHERE sl."invoiceId" = inv.id
+        AND inv."status" IN ('Draft', 'Cancelled')
     `;
 
-    for (const prod of productsWithoutLedger) {
-      const qty = Number(prod.quantity);
-      const dt = prod.createdAt ? new Date(prod.createdAt) : new Date('2020-01-01');
-      await prisma.stockLedger.create({
-        data: {
-          productId: prod.id,
-          date: dt,
-          type: 'INITIAL',
-          quantityChange: qty,
-          runningBalance: qty,
-          createdAt: dt,
-        }
-      });
-    }
+    await prisma.$executeRaw`
+      DELETE FROM "CashLedger" cl
+      USING "Invoice" inv
+      WHERE cl."invoiceId" = inv.id
+        AND inv."status" IN ('Draft', 'Cancelled')
+    `;
 
-    // 2. Sync Product.quantity with the exact sum of StockLedger for all products with ledger entries
-    // This fixes any desynchronization (such as Bin Report showing -1 while StockLedger has 99)
+    await prisma.$executeRaw`
+      DELETE FROM "Payment" p
+      USING "Invoice" inv
+      WHERE p."invoiceId" = inv.id
+        AND inv."status" IN ('Draft', 'Cancelled')
+    `;
+
+    // 1. Sync Product.quantity strictly with the exact sum of valid StockLedger entries for ALL products
     await prisma.$executeRaw`
       UPDATE "Product" p
       SET quantity = COALESCE((
         SELECT SUM(sl."quantityChange")
         FROM "StockLedger" sl
+        LEFT JOIN "Invoice" inv ON inv.id = sl."invoiceId"
         WHERE sl."productId" = p.id
-      ), 0)
-      WHERE EXISTS (
-        SELECT 1 FROM "StockLedger" sl
-        WHERE sl."productId" = p.id
-      );
+          AND (inv.id IS NULL OR inv."status" NOT IN ('Draft', 'Cancelled'))
+      ), 0);
     `;
   } catch (err: any) {
-    console.error('[Inventory Reconcile] Error syncing product quantities with StockLedger:', err?.message || err);
+    logger.error('[Inventory Reconcile] Error syncing product quantities with StockLedger:', { error: err?.message || err, stack: err?.stack });
   }
 }
 
@@ -166,7 +162,8 @@ router.get('/', async (req: Request, res: Response) => {
     }
     
     res.json(productsWithValuation);
-  } catch (error) {
+  } catch (error: any) {
+    logger.error('Failed to fetch inventory:', { error: error?.message || error, stack: error?.stack });
     res.status(500).json({ error: 'Failed to fetch inventory' });
   }
 });
@@ -298,7 +295,7 @@ router.get('/stock-as-of-date', async (req: Request, res: Response) => {
 
     res.json(resultMap);
   } catch (error: any) {
-    console.error('Error fetching point-in-time stock:', error);
+    logger.error('Error fetching point-in-time stock:', { error: error?.message || error, stack: error?.stack });
     res.status(500).json({ error: error.message || 'Failed to fetch point-in-time stock' });
   }
 });
@@ -380,6 +377,7 @@ router.get('/bin-report', async (req: Request, res: Response) => {
           LEFT JOIN "Invoice" inv ON inv.id = sl."invoiceId"
           WHERE sl."productId" IN (${Prisma.join(productIds)})
             AND (inv."companyId" = ${String(companyId)} OR (sl."invoiceId" IS NULL AND EXISTS (SELECT 1 FROM "Product" p WHERE p.id = sl."productId" AND p."companyId" = ${String(companyId)})))
+            AND (inv.id IS NULL OR inv."status" NOT IN ('Draft', 'Cancelled'))
           GROUP BY sl."productId"
         `;
       } else {
@@ -388,7 +386,9 @@ router.get('/bin-report', async (req: Request, res: Response) => {
             sl."productId", 
             SUM(sl."quantityChange") AS "ledgerSum"
           FROM "StockLedger" sl
+          LEFT JOIN "Invoice" inv ON inv.id = sl."invoiceId"
           WHERE sl."productId" IN (${Prisma.join(productIds)})
+            AND (inv.id IS NULL OR inv."status" NOT IN ('Draft', 'Cancelled'))
           GROUP BY sl."productId"
         `;
       }
@@ -450,8 +450,8 @@ router.get('/bin-report', async (req: Request, res: Response) => {
       const part = parts.length > 0 ? parts[idx % parts.length].name : 'Standard';
       const subPart = subParts.length > 0 ? subParts[idx % subParts.length].name : 'General';
 
-      // Always display the true cumulative stock ledger balance if ledger entries exist
-      const actualQuantity = ledgerMap.has(p.id) ? ledgerMap.get(p.id)! : (Number(p.quantity) || 0);
+      // Always display the true cumulative stock ledger balance if ledger entries exist, fallback to 0 if none
+      const actualQuantity = ledgerMap.has(p.id) ? ledgerMap.get(p.id)! : 0;
       const resolvedCompany = p.company?.name || p.invoiceItems?.[0]?.invoice?.company?.name || 'All Companies';
       const resolvedCompanyId = p.companyId || p.invoiceItems?.[0]?.invoice?.companyId || null;
       const resolvedCompanyCode = p.company?.code || p.invoiceItems?.[0]?.invoice?.company?.code || '';
@@ -507,7 +507,7 @@ router.get('/bin-report', async (req: Request, res: Response) => {
 
     res.json(binReport);
   } catch (error: any) {
-    console.error('Failed to generate bin report:', error);
+    logger.error('Failed to generate bin report:', { error: error?.message || error, stack: error?.stack });
     res.status(500).json({ error: error.message || 'Failed to generate bin report' });
   }
 });
@@ -542,7 +542,8 @@ router.get('/:id', async (req: Request, res: Response) => {
 
     const productWithValuation = await calculateValuationsForProduct(product, ledgers);
     res.json(productWithValuation);
-  } catch (error) {
+  } catch (error: any) {
+    logger.error('Failed to fetch product:', { error: error?.message || error, stack: error?.stack });
     res.status(500).json({ error: 'Failed to fetch product' });
   }
 });
@@ -728,10 +729,10 @@ router.post('/', async (req: Request, res: Response) => {
       disabled: product.status === 'Inactive'
     });
   } catch (error: any) {
+    logger.error('Failed to create product:', { error: error?.message || error, stack: error?.stack });
     if (error.code === 'P2002') {
       return res.status(409).json({ error: 'SKU must be unique' });
     }
-    console.error('Failed to create product:', error);
     res.status(500).json({ error: error?.message || 'Failed to create product' });
   }
 });
@@ -904,10 +905,10 @@ router.put('/:id', async (req: Request, res: Response) => {
       disabled: product.status === 'Inactive'
     });
   } catch (error: any) {
+    logger.error('Failed to update product:', { error: error?.message || error, stack: error?.stack });
     if (error.code === 'P2002') {
       return res.status(409).json({ error: 'SKU must be unique' });
     }
-    console.error('Failed to update product:', error);
     res.status(500).json({ error: error?.message || 'Failed to update product' });
   }
 });
@@ -920,7 +921,8 @@ router.delete('/:id', async (req: Request, res: Response) => {
       where: { id },
     });
     res.status(204).send();
-  } catch (error) {
+  } catch (error: any) {
+    logger.error('Failed to delete product:', { error: error?.message || error, stack: error?.stack });
     res.status(500).json({ error: 'Failed to delete product' });
   }
 });
@@ -928,11 +930,22 @@ router.delete('/:id', async (req: Request, res: Response) => {
 // POST bulk upload
 router.post('/bulk-upload', upload.single('file'), async (req: Request, res: Response) => {
   try {
-    console.log(" call bulk-upload :: ");
-    
     if (!req.file) {
       return res.status(400).json({ error: 'No file uploaded' });
     }
+
+    // Save uploaded Excel file to disk for audit & recovery
+    const uploadDir = path.join(process.cwd(), 'uploads', 'bulk_imports', 'items');
+    if (!fs.existsSync(uploadDir)) {
+      fs.mkdirSync(uploadDir, { recursive: true });
+    }
+    const safeName = req.file.originalname.replace(/[^a-zA-Z0-9.-]/g, '_');
+    const savedFileName = `${Date.now()}_${safeName}`;
+    const savedFilePath = path.join(uploadDir, savedFileName);
+    await fs.promises.writeFile(savedFilePath, req.file.buffer);
+    const fileUrl = `/uploads/bulk_imports/items/${savedFileName}`;
+
+    logger.info('Bulk upload items Excel file saved successfully', { originalName: req.file.originalname, fileUrl, size: req.file.size });
 
     const workbook = xlsx.read(req.file.buffer, { type: 'buffer' });
     const sheetName = workbook.SheetNames[0];
@@ -1058,9 +1071,9 @@ router.post('/bulk-upload', upload.single('file'), async (req: Request, res: Res
       }
     }
 
-    res.json({ message: `Successfully processed ${successCount} rows.`, errors });
-  } catch (error) {
-    logger.error('Bulk upload error', { error });
+    res.json({ message: `Successfully processed ${successCount} rows.`, fileUrl, fileName: savedFileName, errors });
+  } catch (error: any) {
+    logger.error('Bulk upload error:', { error: error?.message || error, stack: error?.stack });
     res.status(500).json({ error: 'Failed to process bulk upload' });
   }
 });
@@ -1301,7 +1314,7 @@ router.post('/bulk-import', async (req: Request, res: Response) => {
       errors
     });
   } catch (error: any) {
-    console.error('Failed to bulk import products:', error);
+    logger.error('Failed to bulk import products:', { error: error?.message || error, stack: error?.stack });
     res.status(500).json({ error: error.message || 'Failed to bulk import products' });
   }
 });

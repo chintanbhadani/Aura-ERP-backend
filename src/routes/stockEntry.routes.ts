@@ -1,5 +1,6 @@
 import { Router, Request, Response } from 'express';
 import { PrismaClient } from '@prisma/client';
+import logger from '../utils/logger';
 
 const router = Router();
 const prisma = new PrismaClient();  
@@ -36,20 +37,33 @@ router.get('/', async (req: Request, res: Response) => {
       }
     }
 
+    const andConditions: any[] = [
+      {
+        OR: [
+          { invoiceId: null },
+          { invoice: { status: { notIn: ['Cancelled', 'Draft'] } } }
+        ]
+      }
+    ];
+
     if (search) {
       const q = String(search).trim();
-      const searchOR = [
-        { product: { name: { contains: q, mode: 'insensitive' as const } } },
-        { product: { sku: { contains: q, mode: 'insensitive' as const } } },
-        { invoice: { invoiceNumber: { contains: q, mode: 'insensitive' as const } } },
-        { invoice: { company: { name: { contains: q, mode: 'insensitive' as const } } } },
-      ];
-      if (whereClause.OR) {
-        whereClause.AND = [{ OR: searchOR }];
-      } else {
-        whereClause.OR = searchOR;
-      }
+      andConditions.push({
+        OR: [
+          { product: { name: { contains: q, mode: 'insensitive' as const } } },
+          { product: { sku: { contains: q, mode: 'insensitive' as const } } },
+          { invoice: { invoiceNumber: { contains: q, mode: 'insensitive' as const } } },
+          { invoice: { company: { name: { contains: q, mode: 'insensitive' as const } } } },
+        ]
+      });
     }
+
+    if (whereClause.OR) {
+      andConditions.push({ OR: whereClause.OR });
+      delete whereClause.OR;
+    }
+
+    whereClause.AND = andConditions;
 
     const ledgers = await prisma.stockLedger.findMany({
       where: whereClause,
@@ -115,7 +129,7 @@ router.get('/', async (req: Request, res: Response) => {
 
     res.json(formatted);
   } catch (error: any) {
-    console.error('Error fetching stock entries:', error);
+    logger.error('Error fetching stock entries:', { error: error?.message || error, stack: error?.stack });
     res.status(500).json({ error: error.message || 'Failed to fetch stock entries' });
   }
 });
@@ -180,6 +194,7 @@ router.get('/:id', async (req: Request, res: Response) => {
 
     res.json(formatted);
   } catch (error: any) {
+    logger.error('Failed to fetch stock entry:', { error: error?.message || error, stack: error?.stack });
     res.status(500).json({ error: error.message || 'Failed to fetch stock entry' });
   }
 });
@@ -255,7 +270,7 @@ router.post('/', async (req: Request, res: Response) => {
 
     res.status(201).json(result);
   } catch (error: any) {
-    console.error('Failed to create stock entry:', error);
+    logger.error('Failed to create stock entry:', { error: error?.message || error, stack: error?.stack });
     res.status(500).json({ error: error.message || 'Failed to create stock entry' });
   }
 });
@@ -311,6 +326,7 @@ router.put('/:id', async (req: Request, res: Response) => {
 
     res.json(updated);
   } catch (error: any) {
+    logger.error('Failed to update stock entry:', { error: error?.message || error, stack: error?.stack });
     res.status(500).json({ error: error.message || 'Failed to update stock entry' });
   }
 });
@@ -347,6 +363,7 @@ router.delete('/:id', async (req: Request, res: Response) => {
 
     res.json({ message: 'Stock entry deleted successfully' });
   } catch (error: any) {
+    logger.error('Failed to delete stock entry:', { error: error?.message || error, stack: error?.stack });
     res.status(500).json({ error: error.message || 'Failed to delete stock entry' });
   }
 });
