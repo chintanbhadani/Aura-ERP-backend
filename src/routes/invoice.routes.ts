@@ -236,8 +236,60 @@ router.get('/available-batches/:productId', async (req: Request, res: Response) 
       }
     }
 
-    // Only fallback to INITIAL-STOCK if NO purchase invoice/PO has ever been created for this product
-    if (purchaseItems.length === 0 && product.quantity > 0) {
+    // Add batches from Repack entries (where this product was produced as targetProduct)
+    let repackBatches: any[] = [];
+    try {
+      repackBatches = await prisma.repackEntry.findMany({
+        where: {
+          targetProductId: productId,
+          status: { notIn: ['Cancelled', 'Draft'] },
+        },
+        include: {
+          sourceProduct: true,
+        },
+        orderBy: {
+          date: 'asc',
+        },
+      });
+
+      for (const r of repackBatches) {
+        const targetQty = Number(r.targetQuantity);
+        const sold = soldQtyByPurchaseItem.get(r.id) || 0;
+        const available = targetQty - sold;
+
+        if (available > 0) {
+          const batchDate = new Date(r.date);
+          const isFutureBatch = Boolean(invoiceDateObj && batchDate > invoiceDateObj);
+          if (isFutureBatch) {
+            futureBatchCount++;
+            if (!nextAvailableBatchDate || batchDate < nextAvailableBatchDate) {
+              nextAvailableBatchDate = batchDate;
+            }
+          }
+
+          batches.push({
+            purchaseItemId: r.id,
+            poNumber: r.repackNumber,
+            date: r.date,
+            supplierName: `Repack (${r.sourceProduct?.name || 'Bulk Conversion'})`,
+            unitCost: Number(r.calculatedCost || r.packagingCost || product.cost_price || 0),
+            initialQuantity: targetQty,
+            availableQuantity: isFutureBatch ? 0 : available,
+            totalBatchQuantity: available,
+            isFutureBatch,
+            futureArrivalDate: isFutureBatch ? batchDate.toISOString() : null,
+            batchWarning: isFutureBatch
+              ? `Produced on ${batchDate.toLocaleDateString('en-GB')}. Not available on invoice date.`
+              : undefined,
+          });
+        }
+      }
+    } catch (repackErr) {
+      // ignore if RepackEntry table not yet loaded
+    }
+
+    // Only fallback to INITIAL-STOCK if NO purchase invoice/PO and NO repack has ever been created for this product
+    if (purchaseItems.length === 0 && repackBatches.length === 0 && product.quantity > 0) {
       const initDate = product.createdAt ? new Date(product.createdAt) : new Date('2020-01-01');
       const isFutureInitial = Boolean(invoiceDateObj && initDate > invoiceDateObj);
       if (isFutureInitial) {
